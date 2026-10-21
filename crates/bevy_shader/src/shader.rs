@@ -10,7 +10,6 @@ use thiserror::Error;
 fn scan_wesl_imports(
     source: &str,
     self_module_path: &wesl::syntax::ModulePath,
-    asset_source: Option<&str>,
 ) -> Vec<ShaderImport> {
     use wesl::syntax::{ImportContent, ModulePath, PathOrigin};
 
@@ -67,14 +66,9 @@ fn scan_wesl_imports(
             _ => Cow::Borrowed(path),
         };
         let import = match &path.origin {
-            PathOrigin::Absolute => ShaderImport::AssetPath(match path.components.split_first() {
-                Some((source, rest))
-                    if asset_source.is_some_and(|name| source.strip_suffix(':') == Some(name)) =>
-                {
-                    format!("{source}//{}", rest.join("/"))
-                }
-                _ => format!("/{}", path.components.join("/")),
-            }),
+            PathOrigin::Absolute => {
+                ShaderImport::AssetPath(format!("/{}", path.components.join("/")))
+            }
             PathOrigin::Package(package) => ShaderImport::Custom(
                 core::iter::once(package.as_str())
                     .chain(path.components.iter().map(String::as_str))
@@ -198,22 +192,23 @@ impl Shader {
             None => {
                 let asset_path = AssetPath::parse(path.as_str());
                 let stem = asset_path.path().with_extension("");
-                let stem = std::path::PathBuf::from(stem.to_string_lossy().replace('\\', "/"));
-                let import_path = match asset_path.source() {
+                let stem = stem.to_string_lossy().replace('\\', "/");
+                match asset_path.source() {
                     AssetSourceId::Default => {
-                        format!("/{}", stem.to_string_lossy().trim_start_matches('/'))
+                        ShaderImport::AssetPath(format!("/{}", stem.trim_start_matches('/')))
                     }
-                    source => AssetPath::from_path_buf(stem)
-                        .with_source(source.clone_owned())
-                        .to_string(),
-                };
-                ShaderImport::AssetPath(import_path)
+                    AssetSourceId::Name(source) => ShaderImport::Custom(
+                        core::iter::once(source.as_ref())
+                            .chain(stem.split('/').filter(|part| !part.is_empty()))
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    ),
+                }
             }
         };
 
-        let asset_source = AssetPath::parse(path.as_str()).source().clone_owned();
         let imports = crate::shader_cache::wesl_module_path(&import_path)
-            .map(|module_path| scan_wesl_imports(&source, &module_path, asset_source.as_str()))
+            .map(|module_path| scan_wesl_imports(&source, &module_path))
             .unwrap_or_default();
 
         Shader {
@@ -263,8 +258,6 @@ pub enum ShaderLoaderError {
     Io(#[from] std::io::Error),
     #[error("Could not parse shader: {0}")]
     Parse(#[from] alloc::string::FromUtf8Error),
-    #[error("Shader import `{import}` escapes asset source `{source_path}`")]
-    ImportSource { source_path: String, import: String },
 }
 
 /// Settings for loading shaders.
@@ -325,17 +318,13 @@ impl AssetLoader for ShaderLoader {
                         ShaderImport::AssetPath(asset_path) => {
                             Some(format!("{}.{ext}", asset_path.trim_start_matches('/')))
                         }
-                        ShaderImport::Custom(_) => None,
+                        ShaderImport::Custom(module) => {
+                            let (source, path) = module.split_once("::")?;
+                            Some(format!("{source}://{}.{ext}", path.replace("::", "/")))
+                        }
                     })
                     .collect();
                 for file_path in candidates {
-                    let dependency = AssetPath::from(file_path.clone());
-                    if dependency.source() != load_context.path().source() {
-                        return Err(ShaderLoaderError::ImportSource {
-                            source_path: load_context.path().to_string(),
-                            import: file_path,
-                        });
-                    }
                     if load_context
                         .read_asset_bytes(AssetPath::from(file_path.clone()))
                         .await
@@ -420,6 +409,15 @@ mod tests {
 
     fn shader_app(directory: Dir) -> App {
         let mut app = App::new();
+        let library = directory.clone();
+        app.register_asset_source(
+            "library",
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: library.clone(),
+                })
+            }),
+        );
         app.register_asset_source(
             "scoped",
             AssetSourceBuilder::new(move || {
@@ -469,7 +467,7 @@ mod tests {
             assert!(root.imports.contains(&dependency.import_path));
             assert_eq!(
                 dependency.import_path,
-                ShaderImport::AssetPath(format!("{prefix}/nested/helper"))
+                ShaderImport::Custom(format!("{source}::mount::shaders::nested::helper"))
             );
         }
     }
@@ -527,22 +525,70 @@ mod tests {
     }
 
     #[test]
-    fn relative_import_cannot_escape_to_the_default_asset_source() {
+    fn package_imports_load_registered_asset_sources_without_preloading() {
         let directory = Dir::default();
         directory.insert_asset(
             Path::new("root.wesl"),
-            b"import super::super::outside::value;".as_slice(),
+            b"import library::shared::value; @fragment fn fragment() -> @location(0) vec4<f32> { return vec4(value()); }".as_slice(),
         );
-        let mut app = shader_app(directory);
-        let handle = app
-            .world()
-            .resource::<AssetServer>()
-            .load::<Shader>("scoped://root.wesl");
+        directory.insert_asset(
+            Path::new("shared.wesl"),
+            b"fn value() -> f32 { return f32(constants::LIB_VALUE); }".as_slice(),
+        );
+        let mut app = shader_app(directory.clone());
+        let server = app.world().resource::<AssetServer>().clone();
+        let handle = server.load::<Shader>("scoped://root.wesl");
+        let decoy = server.load::<Shader>("scoped://shared.wesl");
+        until(&mut app, |_| {
+            server.is_loaded_with_dependencies(handle.id())
+                && server.is_loaded_with_dependencies(decoy.id())
+        });
+        let shaders = app.world().resource::<Assets<Shader>>();
+        let root = shaders.get(&handle).unwrap();
+        assert_eq!(root.file_dependencies.len(), 1);
+        let dependency = root.file_dependencies[0].clone();
+        assert_eq!(
+            shaders.get(&dependency).unwrap().path,
+            "library://shared.wesl"
+        );
+        let mut cache = crate::ShaderCache::new((), |_, source, _| match source {
+            crate::ShaderCacheSource::Wgsl(source) => Ok(source),
+            _ => unreachable!(),
+        });
+        for (id, shader) in shaders.iter() {
+            let mut shader = shader.clone();
+            if id == dependency.id() {
+                shader
+                    .shader_defs
+                    .push(ShaderDefVal::UInt("LIB_VALUE".into(), 3));
+            } else if id == decoy.id() {
+                shader
+                    .shader_defs
+                    .push(ShaderDefVal::UInt("LIB_VALUE".into(), 99));
+            }
+            cache.set_shader(id, shader);
+        }
+        let compiled = cache.get(0, handle.id(), &[]).unwrap();
+        assert!(compiled.contains("3"));
+        assert!(!compiled.contains("99"));
+        directory.insert_asset(
+            Path::new("shared.wesl"),
+            b"fn value() -> f32 { return 0.5; }".as_slice(),
+        );
+        server.reload("library://shared.wesl");
         until(&mut app, |app| {
             app.world()
-                .resource::<AssetServer>()
-                .get_load_state(handle.id())
-                .is_some_and(|state| state.is_failed())
+                .resource::<Assets<Shader>>()
+                .get(&dependency)
+                .is_some_and(|shader| shader.source.as_str().contains("0.5"))
         });
+        let updated = app
+            .world()
+            .resource::<Assets<Shader>>()
+            .get(&dependency)
+            .unwrap()
+            .clone();
+        assert!(cache.set_shader(dependency.id(), updated).contains(&0));
+        assert!(cache.get(0, handle.id(), &[]).unwrap().contains("0.5"));
     }
 }
