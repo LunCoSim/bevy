@@ -1,7 +1,8 @@
 use super::ShaderDefVal;
 use alloc::borrow::Cow;
 use bevy_asset::{
-    io::AssetSourceId, io::Reader, Asset, AssetLoader, AssetPath, Handle, LoadContext,
+    io::AssetSourceId, io::Reader, Asset, AssetLoader, AssetPath, AssetServer, AssetServerMode,
+    Handle, LoadContext,
 };
 use bevy_reflect::TypePath;
 use bevy_utils::define_atomic_id;
@@ -174,6 +175,51 @@ impl Shader {
         }
     }
 
+    /// Creates an edited WESL shader and retains imported modules through the
+    /// server's registered asset readers. Run this future off the main thread.
+    /// Unlike `from_wesl`, this prepares file dependencies for an in-memory edit.
+    pub async fn from_wesl_with_dependencies(
+        source: impl Into<Cow<'static, str>>,
+        path: impl Into<String>,
+        asset_server: &AssetServer,
+    ) -> Shader {
+        let mut shader = Self::from_wesl(source, path);
+        for candidate in shader.wesl_dependency_candidates() {
+            let path = AssetPath::from(candidate);
+            // A package can be supplied by embedded shaders rather than a
+            // registered asset source. Only file-backed modules have handles.
+            let Ok(source) = asset_server.get_source(path.source()) else {
+                continue;
+            };
+            let reader = match asset_server.mode() {
+                AssetServerMode::Unprocessed => source.reader(),
+                AssetServerMode::Processed => match source.processed_reader() {
+                    Ok(reader) => reader,
+                    Err(_) => continue,
+                },
+            };
+            if reader.read(path.path()).await.is_ok() {
+                shader.file_dependencies.push(asset_server.load(path));
+            }
+        }
+        shader
+    }
+
+    fn wesl_dependency_candidates(&self) -> Vec<String> {
+        self.imports
+            .iter()
+            .filter_map(|import| match import {
+                ShaderImport::AssetPath(path) => {
+                    Some(format!("{}.wesl", path.trim_start_matches('/')))
+                }
+                ShaderImport::Custom(module) => {
+                    let (source, path) = module.split_once("::")?;
+                    Some(format!("{source}://{}.wesl", path.replace("::", "/")))
+                }
+            })
+            .collect()
+    }
+
     /// Creates a new Wesl shader.
     pub fn from_wesl(source: impl Into<Cow<'static, str>>, path: impl Into<String>) -> Shader {
         let source = source.into();
@@ -311,19 +357,7 @@ impl AssetLoader for ShaderLoader {
         // collect and store file dependencies
         match ext.as_str() {
             "wesl" => {
-                let candidates: Vec<String> = shader
-                    .imports
-                    .iter()
-                    .filter_map(|import| match import {
-                        ShaderImport::AssetPath(asset_path) => {
-                            Some(format!("{}.{ext}", asset_path.trim_start_matches('/')))
-                        }
-                        ShaderImport::Custom(module) => {
-                            let (source, path) = module.split_once("::")?;
-                            Some(format!("{source}://{}.{ext}", path.replace("::", "/")))
-                        }
-                    })
-                    .collect();
+                let candidates = shader.wesl_dependency_candidates();
                 for file_path in candidates {
                     if load_context
                         .read_asset_bytes(AssetPath::from(file_path.clone()))
@@ -470,6 +504,36 @@ mod tests {
                 ShaderImport::Custom(format!("{source}::mount::shaders::nested::helper"))
             );
         }
+    }
+
+    #[test]
+    fn edited_source_retains_new_imports_without_preloading() {
+        let directory = Dir::default();
+        directory.insert_asset(
+            Path::new("shared.wesl"),
+            b"fn value() -> f32 { return 0.75; }".as_slice(),
+        );
+        let mut app = shader_app(directory);
+        let server = app.world().resource::<AssetServer>().clone();
+        let shader = bevy_tasks::block_on(Shader::from_wesl_with_dependencies(
+            "import library::shared::value; @fragment fn fragment() -> @location(0) vec4<f32> { return vec4(value()); }",
+            "scoped://edited.wesl", &server,
+        ));
+        assert_eq!(shader.file_dependencies.len(), 1);
+        let dependency = shader.file_dependencies[0].clone();
+        until(&mut app, |_| {
+            server.is_loaded_with_dependencies(dependency.id())
+        });
+        let mut cache = crate::ShaderCache::new((), |_, source, _| match source {
+            crate::ShaderCacheSource::Wgsl(source) => Ok(source),
+            _ => unreachable!(),
+        });
+        for (id, shader) in app.world().resource::<Assets<Shader>>().iter() {
+            cache.set_shader(id, shader.clone());
+        }
+        let id = bevy_asset::AssetId::default();
+        cache.set_shader(id, shader);
+        assert!(cache.get(0, id, &[]).unwrap().contains("0.75"));
     }
 
     #[test]
