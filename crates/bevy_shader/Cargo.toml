@@ -9,11 +9,11 @@ license = "MIT OR Apache-2.0"
 keywords = ["bevy", "shader"]
 
 [dependencies]
-# bevy
-bevy_asset = { path = "../bevy_asset", version = "0.20.0" }
-bevy_reflect = { path = "../bevy_reflect", version = "0.20.0" }
-bevy_platform = { path = "../bevy_platform", version = "0.20.0" }
-bevy_utils = { path = "../bevy_utils", version = "0.20.0" }
+# Released dependency identities keep this shader patch interoperable with Bevy 0.20.
+bevy_asset = "0.20.0"
+bevy_reflect = "0.20.0"
+bevy_platform = "0.20.0"
+bevy_utils = "0.20.0"
 
 # other
 wgpu-types = { version = "30", default-features = false }
@@ -21,6 +21,10 @@ serde = { version = "1", features = ["derive"] }
 thiserror = { version = "2", default-features = false }
 wesl = { version = "0.6.0", features = ["naga-ext"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+bevy_app = "0.20.0"
+bevy_tasks = "0.20.0"
 
 [lints]
 workspace = true

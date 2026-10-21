@@ -1,6 +1,8 @@
 use super::ShaderDefVal;
 use alloc::borrow::Cow;
-use bevy_asset::{io::Reader, Asset, AssetLoader, AssetPath, Handle, LoadContext};
+use bevy_asset::{
+    io::AssetSourceId, io::Reader, Asset, AssetLoader, AssetPath, Handle, LoadContext,
+};
 use bevy_reflect::TypePath;
 use bevy_utils::define_atomic_id;
 use thiserror::Error;
@@ -8,6 +10,7 @@ use thiserror::Error;
 fn scan_wesl_imports(
     source: &str,
     self_module_path: &wesl::syntax::ModulePath,
+    asset_source: Option<&str>,
 ) -> Vec<ShaderImport> {
     use wesl::syntax::{ImportContent, ModulePath, PathOrigin};
 
@@ -64,9 +67,14 @@ fn scan_wesl_imports(
             _ => Cow::Borrowed(path),
         };
         let import = match &path.origin {
-            PathOrigin::Absolute => {
-                ShaderImport::AssetPath(format!("/{}", path.components.join("/")))
-            }
+            PathOrigin::Absolute => ShaderImport::AssetPath(match path.components.split_first() {
+                Some((source, rest))
+                    if asset_source.is_some_and(|name| source.strip_suffix(':') == Some(name)) =>
+                {
+                    format!("{source}//{}", rest.join("/"))
+                }
+                _ => format!("/{}", path.components.join("/")),
+            }),
             PathOrigin::Package(package) => ShaderImport::Custom(
                 core::iter::once(package.as_str())
                     .chain(path.components.iter().map(String::as_str))
@@ -188,21 +196,24 @@ impl Shader {
                     .join("::"),
             ),
             None => {
-                // Create the shader import path - always starting with "/"
-                let shader_path = std::path::Path::new("/").join(&path);
-
-                // Convert to a string with forward slashes and without extension
-                let import_path_str = shader_path
-                    .with_extension("")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-
-                ShaderImport::AssetPath(import_path_str.to_string())
+                let asset_path = AssetPath::parse(path.as_str());
+                let stem = asset_path.path().with_extension("");
+                let stem = std::path::PathBuf::from(stem.to_string_lossy().replace('\\', "/"));
+                let import_path = match asset_path.source() {
+                    AssetSourceId::Default => {
+                        format!("/{}", stem.to_string_lossy().trim_start_matches('/'))
+                    }
+                    source => AssetPath::from_path_buf(stem)
+                        .with_source(source.clone_owned())
+                        .to_string(),
+                };
+                ShaderImport::AssetPath(import_path)
             }
         };
 
+        let asset_source = AssetPath::parse(path.as_str()).source().clone_owned();
         let imports = crate::shader_cache::wesl_module_path(&import_path)
-            .map(|module_path| scan_wesl_imports(&source, &module_path))
+            .map(|module_path| scan_wesl_imports(&source, &module_path, asset_source.as_str()))
             .unwrap_or_default();
 
         Shader {
@@ -252,6 +263,8 @@ pub enum ShaderLoaderError {
     Io(#[from] std::io::Error),
     #[error("Could not parse shader: {0}")]
     Parse(#[from] alloc::string::FromUtf8Error),
+    #[error("Shader import `{import}` escapes asset source `{source_path}`")]
+    ImportSource { source_path: String, import: String },
 }
 
 /// Settings for loading shaders.
@@ -316,6 +329,13 @@ impl AssetLoader for ShaderLoader {
                     })
                     .collect();
                 for file_path in candidates {
+                    let dependency = AssetPath::from(file_path.clone());
+                    if dependency.source() != load_context.path().source() {
+                        return Err(ShaderLoaderError::ImportSource {
+                            source_path: load_context.path().to_string(),
+                            import: file_path,
+                        });
+                    }
                     if load_context
                         .read_asset_bytes(AssetPath::from(file_path.clone()))
                         .await
@@ -379,5 +399,150 @@ impl From<AssetPath<'static>> for ShaderRef {
 impl From<&'static str> for ShaderRef {
     fn from(path: &'static str) -> Self {
         Self::Path(AssetPath::from(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_app::{App, TaskPoolPlugin};
+    use bevy_asset::{
+        io::{
+            memory::{Dir, MemoryAssetReader},
+            AssetSourceBuilder,
+        },
+        AssetApp, AssetMetaCheck, AssetPlugin, AssetServer, Assets,
+    };
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    fn shader_app(directory: Dir) -> App {
+        let mut app = App::new();
+        app.register_asset_source(
+            "scoped",
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: directory.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin {
+                meta_check: AssetMetaCheck::Never,
+                ..Default::default()
+            },
+        ));
+        app.init_asset::<Shader>()
+            .init_asset_loader::<ShaderLoader>();
+        app.finish();
+        app.cleanup();
+        app
+    }
+
+    fn until(app: &mut App, ready: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.update();
+            if ready(app) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("shader asset did not reach its expected state");
+    }
+
+    #[test]
+    fn named_source_imports_have_the_same_identity_as_their_dependency() {
+        for source in ["lunco", "twin"] {
+            let prefix = format!("{source}://mount/shaders");
+            let root = Shader::from_wesl(
+                "import super::nested::helper::value;",
+                format!("{prefix}/root.wesl"),
+            );
+            let dependency = Shader::from_wesl(
+                "fn value() -> f32 { return 1.0; }",
+                format!("{prefix}/nested/helper.wesl"),
+            );
+            assert!(root.imports.contains(&dependency.import_path));
+            assert_eq!(
+                dependency.import_path,
+                ShaderImport::AssetPath(format!("{prefix}/nested/helper"))
+            );
+        }
+    }
+
+    #[test]
+    fn windows_drive_is_not_an_asset_source_namespace() {
+        let root = Shader::from_wesl("import super::helper::value;", "C:/shaders/root.wesl");
+        let helper = Shader::from_wesl("fn value() {}", "C:/shaders/helper.wesl");
+        assert!(root.imports.contains(&helper.import_path));
+    }
+
+    #[test]
+    fn loader_retains_nested_dependencies_from_the_named_source_without_a_gpu() {
+        let directory = Dir::default();
+        directory.insert_asset(Path::new("shaders/root.wesl"), b"import super::nested::helper::value; @fragment fn fragment() -> @location(0) vec4<f32> { return vec4(value()); }".as_slice());
+        directory.insert_asset(
+            Path::new("shaders/nested/helper.wesl"),
+            b"import super::super::value::number; fn value() -> f32 { return number(); }"
+                .as_slice(),
+        );
+        directory.insert_asset(
+            Path::new("shaders/value.wesl"),
+            b"fn number() -> f32 { return 0.25; }".as_slice(),
+        );
+        let mut app = shader_app(directory);
+        let handle = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<Shader>("scoped://shaders/root.wesl");
+        until(&mut app, |app| {
+            app.world()
+                .resource::<AssetServer>()
+                .is_loaded_with_dependencies(handle.id())
+        });
+        let shaders = app.world().resource::<Assets<Shader>>();
+        let root = shaders.get(&handle).unwrap();
+        assert_eq!(root.file_dependencies.len(), 1);
+        let helper = shaders.get(&root.file_dependencies[0]).unwrap();
+        assert_eq!(helper.path, "scoped://shaders/nested/helper.wesl");
+        assert_eq!(helper.file_dependencies.len(), 1);
+        assert_eq!(
+            shaders.get(&helper.file_dependencies[0]).unwrap().path,
+            "scoped://shaders/value.wesl"
+        );
+        let mut cache = crate::ShaderCache::new((), |_, source, _| match source {
+            crate::ShaderCacheSource::Wgsl(source) => Ok(source),
+            _ => unreachable!(),
+        });
+        for (id, shader) in shaders.iter() {
+            cache.set_shader(id, shader.clone());
+        }
+        let compiled = cache.get(0, handle.id(), &[]).unwrap();
+        assert!(compiled.contains("0.25"));
+        assert!(!compiled.contains("import "));
+    }
+
+    #[test]
+    fn relative_import_cannot_escape_to_the_default_asset_source() {
+        let directory = Dir::default();
+        directory.insert_asset(
+            Path::new("root.wesl"),
+            b"import super::super::outside::value;".as_slice(),
+        );
+        let mut app = shader_app(directory);
+        let handle = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<Shader>("scoped://root.wesl");
+        until(&mut app, |app| {
+            app.world()
+                .resource::<AssetServer>()
+                .get_load_state(handle.id())
+                .is_some_and(|state| state.is_failed())
+        });
     }
 }
