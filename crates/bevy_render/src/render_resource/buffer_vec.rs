@@ -7,7 +7,7 @@ use crate::{
 use bytemuck::{must_cast_slice, NoUninit};
 use encase::{
     internal::{WriteInto, Writer},
-    ShaderType,
+    ShaderSize, ShaderType,
 };
 use thiserror::Error;
 use wgpu::{BindingResource, BufferAddress, BufferUsages};
@@ -683,6 +683,8 @@ where
 ///
 /// This type is useful when you're accumulating "output slots" for a GPU
 /// compute shader to write into.
+/// Slots use the shader array stride, including alignment padding; Rust's
+/// native type size does not define the storage-buffer layout.
 ///
 /// The type `T` need not be [`NoUninit`], unlike [`RawBufferVec`]; it only has to
 /// be [`GpuArrayBufferable`].
@@ -710,7 +712,7 @@ where
             len: 0,
             buffer: None,
             capacity: 0,
-            item_size: size_of::<T>(),
+            item_size: <[T; 1]>::SHADER_SIZE.get() as usize,
             buffer_usage,
             label: None,
             label_changed: false,
@@ -999,4 +1001,37 @@ pub(crate) fn make_buffer_label<'a, T>(label: &'a Option<String>) -> Option<&'a 
         return Some(core::any::type_name::<T>());
     }
     label.as_deref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(ShaderType, Clone)]
+    struct PaddedShaderElement {
+        scalar: f32,
+        vector: bevy_math::Vec3,
+    }
+
+    #[test]
+    fn uninitialized_buffer_uses_shader_array_stride() {
+        assert_eq!(size_of::<PaddedShaderElement>(), 16);
+        assert_eq!(PaddedShaderElement::min_size().get(), 32);
+
+        let mut buffer = UninitBufferVec::<PaddedShaderElement>::new(BufferUsages::STORAGE);
+        assert_eq!(buffer.item_size, 32);
+        assert_eq!(buffer.add_multiple(3), 0);
+        assert_eq!(buffer.add(), 3);
+        assert_eq!(buffer.len() * buffer.item_size, 128);
+        buffer.clear();
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.add(), 0);
+    }
+
+    #[test]
+    fn uninitialized_buffer_rounds_vector_array_stride() {
+        assert_eq!(bevy_math::Vec3::min_size().get(), 12);
+        let buffer = UninitBufferVec::<bevy_math::Vec3>::new(BufferUsages::STORAGE);
+        assert_eq!(buffer.item_size, 16);
+    }
 }
