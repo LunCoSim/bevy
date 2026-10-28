@@ -21,7 +21,7 @@ use crate::{
         BindGroup, DynamicUniformBuffer, ShaderType, Texture, TextureView, TextureViewId,
     },
     renderer::{RenderDevice, RenderQueue},
-    sync_world::MainEntity,
+    sync_world::{MainEntity, MainEntityHashMap},
     texture::{
         CachedTexture, ColorAttachment, DepthStencilAttachment, GpuImage, ManualTextureViews,
         OutputColorAttachment, TextureCache,
@@ -1188,6 +1188,7 @@ pub fn prepare_view_uniforms(
     )>,
     frame_count: Res<FrameCount>,
     shadow_lod_origin: Option<Res<RenderShadowLodOrigin>>,
+    mut camera_lod_origins: Local<MainEntityHashMap<Vec3>>,
 ) {
     let view_iter = views.iter();
     let view_count = view_iter.len();
@@ -1198,6 +1199,18 @@ pub fn prepare_view_uniforms(
     else {
         return;
     };
+    // Retained shadow views refer to cameras by main-world identity. Render
+    // entities have independent IDs, so index the extracted camera positions
+    // by that retained identity once for all cascades in this frame.
+    camera_lod_origins.clear();
+    for (_, camera, view, ..) in &views {
+        if camera.is_some() {
+            camera_lod_origins.insert(
+                view.retained_view_entity.main_entity,
+                view.world_from_view.translation(),
+            );
+        }
+    }
     for (
         entity,
         extracted_camera,
@@ -1267,11 +1280,9 @@ pub fn prepare_view_uniforms(
                 match extracted_view
                     .retained_view_entity
                     .auxiliary_entity
-                    .and_then(|entity| views.get(*entity).ok())
+                    .and_then(|entity| camera_lod_origins.get(&entity))
                 {
-                    Some((_, _, camera_view, _, _, _, _)) => {
-                        camera_view.world_from_view.translation()
-                    }
+                    Some(position) => *position,
                     None => shadow_lod_origin.0,
                 }
             }
