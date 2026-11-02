@@ -192,7 +192,7 @@ pub(crate) fn assign_objects_to_clusters(
         // collect just the relevant query data into a persisted vec to avoid reallocating each frame
         clusterable_objects.extend(point_lights_query.iter().filter_map(
             |(entity, transform, view_visibility, point_light, maybe_layers, volumetric)| {
-                if view_visibility.get() {
+                if view_visibility.get() && point_light.intensity != 0.0 {
                     Some(ClusterableObjectAssignmentData {
                         entity,
                         transform: GlobalTransform::from_translation(transform.translation()),
@@ -210,7 +210,7 @@ pub(crate) fn assign_objects_to_clusters(
         ));
         clusterable_objects.extend(spot_lights_query.iter().filter_map(
             |(entity, transform, view_visibility, spot_light, maybe_layers, volumetric)| {
-                if view_visibility.get() {
+                if view_visibility.get() && spot_light.intensity != 0.0 {
                     Some(ClusterableObjectAssignmentData {
                         entity,
                         transform: *transform,
@@ -232,7 +232,7 @@ pub(crate) fn assign_objects_to_clusters(
         if global_cluster_settings.supports_storage_buffers {
             clusterable_objects.extend(rect_lights_query.iter().filter_map(
                 |(entity, transform, view_visibility, rect_light, maybe_layers)| {
-                    if view_visibility.get() {
+                    if view_visibility.get() && rect_light.intensity != 0.0 {
                         Some(ClusterableObjectAssignmentData {
                             entity,
                             transform: *transform,
@@ -1133,4 +1133,108 @@ fn project_to_plane_y(
         center: y_object.center + distance_to_plane * y_plane.normal(),
         radius: (y_object.radius * y_object.radius - distance_to_plane * distance_to_plane).sqrt(),
     })
+}
+
+#[cfg(test)]
+mod zero_output_tests {
+    use super::*;
+    use bevy_camera::Viewport;
+    use bevy_ecs::{schedule::Schedule, world::World};
+
+    #[test]
+    fn zero_output_lights_leave_and_reenter_cpu_clusters() {
+        let mut world = World::new();
+        world.insert_resource(GlobalClusterSettings {
+            supports_storage_buffers: true,
+            clustered_decals_are_usable: false,
+            gpu_clustering: None,
+            max_uniform_buffer_clusterable_objects: 256,
+            view_cluster_bindings_max_indices: 16384,
+        });
+        let mut camera = Camera {
+            viewport: Some(Viewport {
+                physical_size: bevy_math::UVec2::splat(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        camera.computed.clip_from_view =
+            bevy_math::proj::perspective_infinite_reverse(1.0, 1.0, 0.1);
+        let frustum = Frustum(bevy_shape::ViewFrustum::from_clip_from_world_custom_far(
+            &camera.computed.clip_from_view,
+            &Vec3::ZERO,
+            &Vec3::Z,
+            100.0,
+        ));
+        let view = world
+            .spawn((
+                camera,
+                GlobalTransform::default(),
+                frustum,
+                ClusterConfig::XYZ {
+                    dimensions: UVec3::splat(4),
+                    z_config: super::super::ClusterZConfig {
+                        first_slice_depth: 0.1,
+                        far_z_mode: ClusterFarZMode::Constant(100.0),
+                    },
+                    dynamic_resizing: false,
+                },
+                Clusters::default(),
+            ))
+            .id();
+        let transform = GlobalTransform::from_translation(Vec3::new(0.0, 0.0, -5.0));
+        let point = world
+            .spawn((
+                PointLight {
+                    intensity: 0.0,
+                    ..Default::default()
+                },
+                transform,
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        let spot = world
+            .spawn((
+                SpotLight {
+                    intensity: 0.0,
+                    ..Default::default()
+                },
+                transform,
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        let rect = world
+            .spawn((
+                RectLight {
+                    intensity: 0.0,
+                    ..Default::default()
+                },
+                transform,
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(assign_objects_to_clusters);
+        for intensity in [0.0, 1000.0, 0.0, f32::MIN_POSITIVE, 0.0] {
+            world.get_mut::<PointLight>(point).unwrap().intensity = intensity;
+            world.get_mut::<SpotLight>(spot).unwrap().intensity = intensity;
+            world.get_mut::<RectLight>(rect).unwrap().intensity = intensity;
+            schedule.run(&mut world);
+            let ClusterableObjects::Cpu(clusters) =
+                &world.get::<Clusters>(view).unwrap().clusterable_objects
+            else {
+                panic!("CPU clustering unexpectedly disabled");
+            };
+            for entity in [point, spot, rect] {
+                assert_eq!(
+                    clusters
+                        .iter()
+                        .any(|cluster| cluster.iter().any(|e| *e == entity)),
+                    intensity != 0.0,
+                    "entity {entity:?}, intensity {intensity}, clusters {clusters:?}"
+                );
+                assert!(world.get::<ViewVisibility>(entity).unwrap().get());
+            }
+        }
+    }
 }

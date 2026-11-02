@@ -467,6 +467,9 @@ pub fn extract_lights(
 
     all_lights_found.clear();
 
+    // Zero-output lights cannot illuminate or cast a shadow. Remove their extracted
+    // components without changing main-world visibility so Changed<Light> restores
+    // them normally when their output becomes positive again.
     for (
         main_entity,
         render_entity,
@@ -479,7 +482,7 @@ pub fn extract_lights(
         volumetric_light,
     ) in point_lights.iter()
     {
-        if !view_visibility.get() {
+        if !view_visibility.get() || point_light.intensity == 0.0 {
             if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
                 entity_commands.remove::<ExtractedPointLight>();
             }
@@ -611,7 +614,7 @@ pub fn extract_lights(
         volumetric_light,
     ) in spot_lights.iter()
     {
-        if !view_visibility.get() {
+        if !view_visibility.get() || spot_light.intensity == 0.0 {
             if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
                 entity_commands.remove::<ExtractedPointLight>();
             }
@@ -905,7 +908,7 @@ pub fn extract_lights(
             );
             *rect_light_missing_luts_warning_emitted = true;
         }
-        if !view_visibility.get() {
+        if !view_visibility.get() || rect_light.intensity == 0.0 {
             if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
                 entity_commands.remove::<ExtractedRectLight>();
             }
@@ -3160,5 +3163,113 @@ pub fn extract_shadow_lod_origin(
             render_shadow_lod_origin.0 = global_transform.translation();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod zero_output_tests {
+    use super::*;
+    use bevy_render::MainWorld;
+
+    #[test]
+    fn zero_output_lights_leave_and_reenter_extraction_without_visibility_changes() {
+        let mut render_world = World::new();
+        let point_render = render_world.spawn_empty().id();
+        let spot_render = render_world.spawn_empty().id();
+        let rect_render = render_world.spawn_empty().id();
+        let mut main_world = MainWorld::default();
+        main_world.init_resource::<PointLightShadowMap>();
+        main_world.init_resource::<DirectionalLightShadowMap>();
+        let point = main_world
+            .spawn((
+                PointLight {
+                    intensity: 0.0,
+                    shadow_maps_enabled: true,
+                    ..default()
+                },
+                RenderEntity::from(point_render),
+                ViewVisibility::VISIBLE,
+                CubemapVisibleEntities::default(),
+                CubemapFrusta::default(),
+                GlobalTransform::default(),
+            ))
+            .id();
+        let spot = main_world
+            .spawn((
+                SpotLight {
+                    intensity: 0.0,
+                    shadow_maps_enabled: true,
+                    ..default()
+                },
+                RenderEntity::from(spot_render),
+                ViewVisibility::VISIBLE,
+                VisibleMeshEntities::default(),
+                Frustum::default(),
+                GlobalTransform::default(),
+            ))
+            .id();
+        let rect = main_world
+            .spawn((
+                RectLight {
+                    intensity: 0.0,
+                    ..default()
+                },
+                RenderEntity::from(rect_render),
+                ViewVisibility::VISIBLE,
+                GlobalTransform::default(),
+            ))
+            .id();
+        render_world.insert_resource(main_world);
+        let mut schedule = Schedule::default();
+        schedule.add_systems(extract_lights);
+
+        // Exercise both transitions repeatedly, including a very small positive
+        // output: this is an exact zero test, never a brightness threshold.
+        for intensity in [0.0, 1000.0, 0.0, f32::MIN_POSITIVE, 0.0] {
+            {
+                let mut main = render_world.resource_mut::<MainWorld>();
+                main.get_mut::<PointLight>(point).unwrap().intensity = intensity;
+                main.get_mut::<SpotLight>(spot).unwrap().intensity = intensity;
+                main.get_mut::<RectLight>(rect).unwrap().intensity = intensity;
+            }
+            schedule.run(&mut render_world);
+            let active = intensity != 0.0;
+            assert_eq!(
+                render_world
+                    .get::<ExtractedPointLight>(point_render)
+                    .is_some(),
+                active
+            );
+            assert_eq!(
+                render_world
+                    .get::<ExtractedPointLight>(spot_render)
+                    .is_some(),
+                active
+            );
+            assert_eq!(
+                render_world
+                    .get::<ExtractedRectLight>(rect_render)
+                    .is_some(),
+                active
+            );
+            for entity in [point_render, spot_render] {
+                assert_eq!(
+                    render_world
+                        .get::<RenderExtractedShadowMapVisibleEntities>(entity)
+                        .is_some(),
+                    active
+                );
+                assert_eq!(
+                    render_world
+                        .get::<RenderShadowMapVisibleEntities>(entity)
+                        .is_some(),
+                    active
+                );
+            }
+            let main = render_world.resource::<MainWorld>();
+            for entity in [point, spot, rect] {
+                assert!(main.get::<ViewVisibility>(entity).unwrap().get());
+            }
+        }
     }
 }
