@@ -121,6 +121,12 @@ struct PbrInput {
     /// Multiplier applied to all directional lights before cascade and contact shadows,
     /// use this for custom shadow maps. Defaults to 1.0.
     directional_shadow_factor: f32,
+    /// Front-surface radiance multiplier for the selected directional lights.
+    /// Transmission and other lighting remain independent. Defaults to 1.0.
+    directional_light_scale: f32,
+    /// Native light indices selected by bit; zero leaves all lights unchanged.
+    /// The native light buffer admits at most ten directional lights.
+    directional_light_scale_mask: u32,
 };
 
 /// Creates a PbrInput with default values
@@ -149,6 +155,8 @@ fn pbr_input_new() -> PbrInput {
 
     pbr_input.flags = 0u;
     pbr_input.directional_shadow_factor = 1.0;
+    pbr_input.directional_light_scale = 1.0;
+    pbr_input.directional_light_scale_mask = 0u;
 
     return pbr_input;
 }

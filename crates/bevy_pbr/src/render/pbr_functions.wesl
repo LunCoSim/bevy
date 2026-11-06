@@ -616,7 +616,9 @@ fn apply_pbr_lighting(
 
         @if(DIRECTIONAL_LIGHT_SHADOW_MAP_DEBUG_CASCADES)
         light_contrib = shadows::cascade_debug_visualization(light_contrib, i, view_z);
-        direct_light += light_contrib * shadow;
+        let response = select(1.0, in.directional_light_scale,
+            (in.directional_light_scale_mask & (1u << i)) != 0u);
+        direct_light += light_contrib * shadow * response;
 
 @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION) {
         // NOTE: We use the diffuse transmissive color, the second Lambertian lobe's calculated
