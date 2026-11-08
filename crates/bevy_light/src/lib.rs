@@ -13,13 +13,13 @@ use bevy_camera::{
         NoFrustumCulling, RenderLayers, ViewVisibility, VisibilityRange, VisibilitySystems,
         VisibleEntities, VisibleEntityRanges, VisibleMeshEntities,
     },
-    Camera, Camera3d, CameraUpdateSystems, RenderTarget, ShadowLodOrigin,
+    Camera, Camera3d, CameraUpdateSystems, Projection, RenderTarget, ShadowLodOrigin,
 };
 use bevy_ecs::{entity::EntityHashSet, prelude::*, system::QueryLens};
 #[cfg(feature = "bevy_gizmos")]
 use bevy_gizmos::frustum::FrustumGizmoSystems;
 use bevy_log::warn_once;
-use bevy_math::Vec3A;
+use bevy_math::{DMat4, DVec2, DVec4, UVec2, Vec3A};
 use bevy_mesh::Mesh3d;
 use bevy_reflect::prelude::*;
 use bevy_transform::{components::GlobalTransform, TransformSystems};
@@ -45,7 +45,7 @@ pub use atmosphere::Atmosphere;
 mod volumetric;
 pub use volumetric::{FogVolume, VolumetricFog, VolumetricLight};
 pub mod cascade;
-use cascade::build_directional_light_cascades;
+use cascade::{build_directional_light_cascades, Cascade};
 pub use cascade::{CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades};
 mod point_light;
 pub use point_light::{
@@ -344,6 +344,8 @@ pub fn check_dir_light_mesh_visibility(
     mut directional_lights: Query<
         (
             &DirectionalLight,
+            &CascadeShadowConfig,
+            &Cascades,
             &CascadesFrusta,
             &mut CascadesVisibleEntities,
             Option<&RenderLayers>,
@@ -351,6 +353,12 @@ pub fn check_dir_light_mesh_visibility(
         ),
         Without<SpotLight>,
     >,
+    camera_views: Query<(
+        &Camera,
+        &Projection,
+        &GlobalTransform,
+        Option<&ShadowFilteringMethod>,
+    )>,
     visible_entity_query: Query<
         (
             Entity,
@@ -374,8 +382,15 @@ pub fn check_dir_light_mesh_visibility(
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
 
-    for (directional_light, frusta, mut visible_entities, maybe_view_mask, light_view_visibility) in
-        &mut directional_lights
+    for (
+        directional_light,
+        cascade_config,
+        cascades,
+        frusta,
+        mut visible_entities,
+        maybe_view_mask,
+        light_view_visibility,
+    ) in &mut directional_lights
     {
         let mut views_to_remove = Vec::new();
         for (view, cascade_view_entities) in &mut visible_entities.entities {
@@ -406,6 +421,59 @@ pub fn check_dir_light_mesh_visibility(
         let view_mask = maybe_view_mask.unwrap_or_default();
 
         for (view, view_frusta) in &frusta.frusta {
+            let receiver_bounds = camera_views
+                .get(*view)
+                .ok()
+                .and_then(|(camera, projection, transform, filtering)| {
+                    if !directional_shadow_receiver_culling_supported(directional_light) {
+                        return None;
+                    }
+                    let cascade_views = cascades.cascades.get(view)?;
+                    if !camera.is_active
+                        || camera.sub_camera_view.is_some()
+                        || cascade_views.len() != view_frusta.len()
+                        || cascade_config.bounds.len() != view_frusta.len()
+                    {
+                        return None;
+                    }
+
+                    let viewport_size = camera.physical_viewport_size()?;
+                    if viewport_size.x == 0 || viewport_size.y == 0 {
+                        return None;
+                    }
+
+                    let filter_radius =
+                        directional_shadow_filter_radius(filtering.copied().unwrap_or_default())?;
+                    let overlap_factor = 1.0 - cascade_config.overlap_proportion;
+                    let near_bounds = [cascade_config.minimum_distance]
+                        .into_iter()
+                        .chain(cascade_config.bounds.iter().map(|far| overlap_factor * far));
+                    Some(
+                        near_bounds
+                            .zip(&cascade_config.bounds)
+                            .zip(cascade_views)
+                            .map(|((near, far), cascade)| {
+                                directional_shadow_receiver_bounds(
+                                    projection,
+                                    transform,
+                                    cascade,
+                                    near,
+                                    *far,
+                                    viewport_size,
+                                    filter_radius,
+                                    directional_light.shadow_normal_bias,
+                                )
+                            })
+                            .collect::<SmallVec<[Option<DirectionalShadowReceiverBounds>; 4]>>(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    let mut bounds =
+                        SmallVec::<[Option<DirectionalShadowReceiverBounds>; 4]>::new();
+                    bounds.resize(view_frusta.len(), None);
+                    bounds
+                });
+
             // Resize any per-thread buffer left at a stale state from a prior frame.
             // Threads receiving no work this frame won't run the `init` closure from `par_iter`, and without this
             // their buffer might be indexed out-of-bounds during collection if the number of cascades has increased.
@@ -449,13 +517,23 @@ pub fn check_dir_light_mesh_visibility(
 
                     if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
                         let mut visible = false;
-                        for (frustum, frustum_visible_entities) in view_frusta
+                        for (cascade_index, (frustum, frustum_visible_entities)) in view_frusta
                             .iter()
                             .zip(view_visible_entities_local_queue.iter_mut())
+                            .enumerate()
                         {
                             // Disable near-plane culling, as a shadow caster could lie before the near plane.
                             if !has_no_frustum_culling
                                 && !frustum.intersects_obb(aabb, &transform.affine(), false, true)
+                            {
+                                continue;
+                            }
+                            if !has_no_frustum_culling
+                                && receiver_bounds[cascade_index].is_some_and(|bounds| {
+                                    aabb_is_outside_directional_shadow_receiver_bounds(
+                                        aabb, transform, &bounds,
+                                    )
+                                })
                             {
                                 continue;
                             }
@@ -507,6 +585,339 @@ pub fn check_dir_light_mesh_visibility(
             }
         }
     });
+}
+
+/// Conservative screen-receiver bounds in directional-light clip space.
+///
+/// Directional casters may be arbitrarily far upstream of a receiver, so the
+/// bounds constrain only light-space X/Y. Z is deliberately unbounded here.
+#[derive(Clone, Copy)]
+struct DirectionalShadowReceiverBounds {
+    clip_from_world: DMat4,
+    axes: [DirectionalShadowReceiverAxis; 8],
+    vertex_count: u8,
+    min: DVec2,
+    max: DVec2,
+    padding: DVec2,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DirectionalShadowReceiverAxis {
+    direction: DVec2,
+    min: f64,
+    max: f64,
+}
+
+fn directional_shadow_filter_radius(method: ShadowFilteringMethod) -> Option<f64> {
+    match method {
+        ShadowFilteringMethod::Hardware2x2 => Some(1.0),
+        ShadowFilteringMethod::Gaussian => Some(3.0),
+        ShadowFilteringMethod::Temporal => None,
+    }
+}
+
+fn directional_shadow_receiver_culling_supported(_light: &DirectionalLight) -> bool {
+    #[cfg(feature = "experimental_pbr_pcss")]
+    if _light.soft_shadow_size.is_some_and(|size| size > 0.0) {
+        return false;
+    }
+
+    true
+}
+
+/// Projects the full camera frustum slice into one cascade's light-space plane.
+/// Filter and normal-bias footprints are included so this test cannot remove a
+/// caster whose shadow sample can reach a visible receiver.
+fn directional_shadow_receiver_bounds(
+    projection: &Projection,
+    world_from_view: &GlobalTransform,
+    cascade: &Cascade,
+    near: f32,
+    far: f32,
+    viewport_size: UVec2,
+    filter_radius: f64,
+    shadow_normal_bias: f32,
+) -> Option<DirectionalShadowReceiverBounds> {
+    let clip_from_world = cascade.clip_from_world.as_dmat4();
+    let world_from_view = world_from_view.to_matrix().as_dmat4();
+    if !near.is_finite()
+        || !far.is_finite()
+        || near < 0.0
+        || near >= far
+        || !filter_radius.is_finite()
+        || filter_radius < 0.0
+        || !shadow_normal_bias.is_finite()
+        || !cascade.texel_size.is_finite()
+        || cascade.texel_size <= 0.0
+        || !world_from_view.is_finite()
+        || !clip_from_world.is_finite()
+        || clip_from_world.row(3) != DVec4::W
+    {
+        return None;
+    }
+
+    let mut min = DVec2::splat(f64::INFINITY);
+    let mut max = DVec2::splat(f64::NEG_INFINITY);
+    let mut numerical_padding = DVec2::ZERO;
+    let mut points = SmallVec::<[DVec2; 8]>::new();
+    let corners =
+        frustum_corners_with_temporal_jitter_margin(projection, near, far, viewport_size)?;
+    for corner in corners {
+        let point = corner.as_dvec3().extend(1.0);
+        let world = world_from_view * point;
+        let clip = clip_from_world * world;
+        let world_magnitude = world_from_view.abs() * point.abs();
+        let clip_magnitude = clip_from_world.abs() * world_magnitude;
+        let error = clip_magnitude.truncate().truncate() * (64.0 * f32::EPSILON as f64);
+        let xy = clip.truncate().truncate();
+        if !xy.is_finite() || !error.is_finite() {
+            return None;
+        }
+        min = min.min(xy);
+        max = max.max(xy);
+        numerical_padding = numerical_padding.max(error);
+        points.push(xy);
+    }
+
+    let (vertices, vertex_count) = directional_shadow_receiver_hull(points)?;
+    let axes = directional_shadow_receiver_axes(&vertices[..usize::from(vertex_count)])?;
+
+    let scale = DVec2::new(
+        clip_from_world.row(0).truncate().length(),
+        clip_from_world.row(1).truncate().length(),
+    );
+    let padding = scale
+        * (f64::from(cascade.texel_size)
+            * (filter_radius + f64::from(shadow_normal_bias.abs()) * core::f64::consts::SQRT_2));
+    let padding = padding + numerical_padding;
+    if !min.is_finite()
+        || !max.is_finite()
+        || min.x > max.x
+        || min.y > max.y
+        || !padding.is_finite()
+        || padding.min_element() < 0.0
+    {
+        return None;
+    }
+
+    Some(DirectionalShadowReceiverBounds {
+        clip_from_world,
+        axes,
+        vertex_count,
+        min: min - padding,
+        max: max + padding,
+        padding,
+    })
+}
+
+/// Returns the convex light-space silhouette of the projected receiver slice.
+/// The projection of a convex frustum slice is the convex hull of its projected
+/// corners; casters outside that hull cannot contribute to any receiver sample.
+fn directional_shadow_receiver_hull(mut points: SmallVec<[DVec2; 8]>) -> Option<([DVec2; 8], u8)> {
+    points.sort_unstable_by(|left, right| {
+        left.x
+            .total_cmp(&right.x)
+            .then_with(|| left.y.total_cmp(&right.y))
+    });
+    points.dedup();
+    if points.len() < 3 || points.iter().any(|point| !point.is_finite()) {
+        return None;
+    }
+
+    let mut lower = SmallVec::<[DVec2; 8]>::new();
+    for point in points.iter().copied() {
+        while lower.len() >= 2
+            && directional_shadow_hull_cross(lower[lower.len() - 2], lower[lower.len() - 1], point)
+                <= 0.0
+        {
+            lower.pop();
+        }
+        lower.push(point);
+    }
+
+    let mut upper = SmallVec::<[DVec2; 8]>::new();
+    for point in points.iter().rev().copied() {
+        while upper.len() >= 2
+            && directional_shadow_hull_cross(upper[upper.len() - 2], upper[upper.len() - 1], point)
+                <= 0.0
+        {
+            upper.pop();
+        }
+        upper.push(point);
+    }
+
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    if lower.len() < 3 || lower.len() > 8 {
+        return None;
+    }
+
+    let mut vertices = [DVec2::ZERO; 8];
+    vertices[..lower.len()].copy_from_slice(&lower);
+    Some((vertices, lower.len() as u8))
+}
+
+fn directional_shadow_hull_cross(origin: DVec2, a: DVec2, b: DVec2) -> f64 {
+    (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x)
+}
+
+fn directional_shadow_receiver_axes(
+    vertices: &[DVec2],
+) -> Option<[DirectionalShadowReceiverAxis; 8]> {
+    if !(3..=8).contains(&vertices.len()) || vertices.iter().any(|vertex| !vertex.is_finite()) {
+        return None;
+    }
+
+    let mut axes = [DirectionalShadowReceiverAxis::default(); 8];
+    for index in 0..vertices.len() {
+        let edge = vertices[(index + 1) % vertices.len()] - vertices[index];
+        let direction = DVec2::new(-edge.y, edge.x);
+        if !direction.is_finite() || direction == DVec2::ZERO {
+            return None;
+        }
+
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for vertex in vertices {
+            let projection = vertex.dot(direction);
+            if !projection.is_finite() {
+                return None;
+            }
+            min = min.min(projection);
+            max = max.max(projection);
+        }
+        axes[index] = DirectionalShadowReceiverAxis {
+            direction,
+            min,
+            max,
+        };
+    }
+
+    Some(axes)
+}
+
+/// Expand each built-in frustum slice by half a physical pixel on every side.
+/// Bevy applies `TemporalJitter` to the extracted projection, after main-world
+/// visibility has run. This envelope includes every documented jitter offset
+/// without coupling `bevy_light` to `bevy_render`. Custom projections and
+/// sub-camera views keep native culling because their jitter envelope is not
+/// defined by this projection contract.
+fn frustum_corners_with_temporal_jitter_margin(
+    projection: &Projection,
+    near: f32,
+    far: f32,
+    viewport_size: UVec2,
+) -> Option<[Vec3A; 8]> {
+    if viewport_size.x == 0 || viewport_size.y == 0 {
+        return None;
+    }
+    if !matches!(
+        projection,
+        Projection::Perspective(_) | Projection::Orthographic(_)
+    ) {
+        return None;
+    }
+
+    let mut corners = projection.get_frustum_corners(-near, -far);
+    for plane_start in [0, 4] {
+        let plane = &corners[plane_start..plane_start + 4];
+        let mut min = bevy_math::Vec2::splat(f32::INFINITY);
+        let mut max = bevy_math::Vec2::splat(f32::NEG_INFINITY);
+        for corner in plane {
+            min = min.min(corner.truncate());
+            max = max.max(corner.truncate());
+        }
+        let span = max - min;
+        if !min.is_finite() || !max.is_finite() || span.min_element() <= 0.0 {
+            return None;
+        }
+
+        let margin = span / viewport_size.as_vec2() * 0.5;
+        let center = (min + max) * 0.5;
+        for corner in &mut corners[plane_start..plane_start + 4] {
+            corner.x += if corner.x <= center.x {
+                -margin.x
+            } else {
+                margin.x
+            };
+            corner.y += if corner.y <= center.y {
+                -margin.y
+            } else {
+                margin.y
+            };
+        }
+    }
+
+    Some(corners)
+}
+
+/// Returns true only when the complete projected mesh AABB misses the receiver
+/// hull. Invalid or non-affine bounds stay visible to preserve correctness.
+fn aabb_is_outside_directional_shadow_receiver_bounds(
+    aabb: &Aabb,
+    model_to_world: &GlobalTransform,
+    receiver: &DirectionalShadowReceiverBounds,
+) -> bool {
+    let center = aabb.center.as_dvec3();
+    let half_extents = aabb.half_extents.as_dvec3();
+    let model_to_world = model_to_world.to_matrix().as_dmat4();
+    if !center.is_finite()
+        || !half_extents.is_finite()
+        || half_extents.x < 0.0
+        || half_extents.y < 0.0
+        || half_extents.z < 0.0
+        || !model_to_world.is_finite()
+    {
+        return false;
+    }
+
+    let local_center = center.extend(1.0);
+    let local_half_extents = half_extents.extend(0.0);
+    let world_center = model_to_world * local_center;
+    let world_center_magnitude = model_to_world.abs() * local_center.abs();
+    let world_half_extents = model_to_world.abs() * local_half_extents;
+    let clip_center = receiver.clip_from_world * world_center;
+    let clip_center_magnitude = receiver.clip_from_world.abs() * world_center_magnitude;
+    let clip_half_extents = receiver.clip_from_world.abs() * world_half_extents;
+    let error = (clip_center_magnitude.truncate().truncate()
+        + clip_half_extents.truncate().truncate())
+        * (64.0 * f32::EPSILON as f64);
+    let center = clip_center.truncate().truncate();
+    let half_extents = clip_half_extents.truncate().truncate();
+    if !center.is_finite() || !half_extents.is_finite() || !error.is_finite() {
+        return false;
+    }
+
+    let min = center - half_extents - error;
+    let max = center + half_extents + error;
+    if max.x < receiver.min.x
+        || min.x > receiver.max.x
+        || max.y < receiver.min.y
+        || min.y > receiver.max.y
+    {
+        return true;
+    }
+
+    for axis in &receiver.axes[..usize::from(receiver.vertex_count)] {
+        let axis_abs = axis.direction.abs();
+        let receiver_padding = receiver.padding.dot(axis_abs);
+        let aabb_center = center.dot(axis.direction);
+        let aabb_radius = half_extents.dot(axis_abs) + error.dot(axis_abs);
+        if !receiver_padding.is_finite() || !aabb_center.is_finite() || !aabb_radius.is_finite() {
+            return false;
+        }
+
+        let receiver_min = axis.min - receiver_padding;
+        let receiver_max = axis.max + receiver_padding;
+        let aabb_min = aabb_center - aabb_radius;
+        let aabb_max = aabb_center + aabb_radius;
+        if aabb_max < receiver_min || aabb_min > receiver_max {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Updates the visibility for [`PointLight`]s and [`SpotLight`]s so that shadow
@@ -797,4 +1208,285 @@ pub fn get_shadow_lod_origin(
     };
 
     None
+}
+
+#[cfg(test)]
+mod directional_shadow_receiver_tests {
+    use super::*;
+    use bevy_camera::PerspectiveProjection;
+    use bevy_math::{Mat4, Vec3, Vec3A};
+    use bevy_transform::components::Transform;
+
+    fn receiver_bounds(min: DVec2, max: DVec2) -> DirectionalShadowReceiverBounds {
+        receiver_hull(
+            &[min, DVec2::new(max.x, min.y), max, DVec2::new(min.x, max.y)],
+            DVec2::ZERO,
+        )
+    }
+
+    fn receiver_hull(points: &[DVec2], padding: DVec2) -> DirectionalShadowReceiverBounds {
+        let mut projected = SmallVec::<[DVec2; 8]>::new();
+        projected.extend(points.iter().copied());
+        let (vertices, vertex_count) = directional_shadow_receiver_hull(projected).unwrap();
+        let hull = &vertices[..usize::from(vertex_count)];
+        let axes = directional_shadow_receiver_axes(hull).unwrap();
+        let min = hull
+            .iter()
+            .fold(DVec2::splat(f64::INFINITY), |min, point| min.min(*point))
+            - padding;
+        let max = hull
+            .iter()
+            .fold(DVec2::splat(f64::NEG_INFINITY), |max, point| {
+                max.max(*point)
+            })
+            + padding;
+        DirectionalShadowReceiverBounds {
+            clip_from_world: DMat4::IDENTITY,
+            axes,
+            vertex_count,
+            min,
+            max,
+            padding,
+        }
+    }
+
+    #[test]
+    fn rejects_a_caster_whose_projected_bounds_miss_the_receiver_slice() {
+        let receivers = receiver_bounds(DVec2::splat(-1.0), DVec2::splat(1.0));
+        let caster = Aabb::from_min_max(Vec3::new(2.0, -0.25, -100.0), Vec3::new(3.0, 0.25, 100.0));
+
+        assert!(aabb_is_outside_directional_shadow_receiver_bounds(
+            &caster,
+            &GlobalTransform::IDENTITY,
+            &receivers,
+        ));
+    }
+
+    #[test]
+    fn retains_an_upstream_caster_that_can_shadow_a_receiver() {
+        let receivers = receiver_bounds(DVec2::splat(-1.0), DVec2::splat(1.0));
+        let caster = Aabb::from_min_max(
+            Vec3::new(-0.25, -0.25, 100_000.0),
+            Vec3::new(0.25, 0.25, 100_010.0),
+        );
+
+        assert!(!aabb_is_outside_directional_shadow_receiver_bounds(
+            &caster,
+            &GlobalTransform::IDENTITY,
+            &receivers,
+        ));
+    }
+
+    #[test]
+    fn rejects_a_caster_inside_the_receiver_rectangle_but_outside_its_hull() {
+        let receivers = receiver_hull(
+            &[
+                DVec2::new(0.0, -1.0),
+                DVec2::new(1.0, 0.0),
+                DVec2::new(0.0, 1.0),
+                DVec2::new(-1.0, 0.0),
+            ],
+            DVec2::ZERO,
+        );
+        let caster = Aabb::from_min_max(Vec3::new(0.75, 0.75, -10.0), Vec3::new(0.95, 0.95, 10.0));
+
+        assert!(aabb_is_outside_directional_shadow_receiver_bounds(
+            &caster,
+            &GlobalTransform::IDENTITY,
+            &receivers,
+        ));
+    }
+
+    #[test]
+    fn retains_a_caster_intersecting_the_receiver_hull() {
+        let receivers = receiver_hull(
+            &[
+                DVec2::new(0.0, -1.0),
+                DVec2::new(1.0, 0.0),
+                DVec2::new(0.0, 1.0),
+                DVec2::new(-1.0, 0.0),
+            ],
+            DVec2::ZERO,
+        );
+        let caster = Aabb::from_min_max(
+            Vec3::new(0.35, 0.35, 100_000.0),
+            Vec3::new(0.55, 0.55, 100_010.0),
+        );
+
+        assert!(!aabb_is_outside_directional_shadow_receiver_bounds(
+            &caster,
+            &GlobalTransform::IDENTITY,
+            &receivers,
+        ));
+    }
+
+    #[test]
+    fn receiver_hull_padding_preserves_shadow_filter_footprints() {
+        let receivers = receiver_hull(
+            &[
+                DVec2::new(0.0, -1.0),
+                DVec2::new(1.0, 0.0),
+                DVec2::new(0.0, 1.0),
+                DVec2::new(-1.0, 0.0),
+            ],
+            DVec2::splat(0.1),
+        );
+        let caster = Aabb::from_min_max(Vec3::new(0.55, 0.55, -10.0), Vec3::new(0.65, 0.65, 10.0));
+
+        assert!(!aabb_is_outside_directional_shadow_receiver_bounds(
+            &caster,
+            &GlobalTransform::IDENTITY,
+            &receivers,
+        ));
+    }
+
+    #[test]
+    fn invalid_caster_bounds_remain_visible_to_the_native_culling_path() {
+        let receivers = receiver_bounds(DVec2::splat(-1.0), DVec2::splat(1.0));
+        let caster = Aabb {
+            center: Vec3A::splat(f32::NAN),
+            half_extents: Vec3A::ONE,
+        };
+
+        assert!(!aabb_is_outside_directional_shadow_receiver_bounds(
+            &caster,
+            &GlobalTransform::IDENTITY,
+            &receivers,
+        ));
+    }
+
+    #[test]
+    fn degenerate_projected_hull_uses_native_culling() {
+        let mut points = SmallVec::<[DVec2; 8]>::new();
+        points.extend([
+            DVec2::new(0.0, 0.0),
+            DVec2::new(1.0, 1.0),
+            DVec2::new(2.0, 2.0),
+        ]);
+
+        assert!(directional_shadow_receiver_hull(points).is_none());
+    }
+
+    #[test]
+    fn non_finite_projected_hull_uses_native_culling() {
+        let mut points = SmallVec::<[DVec2; 8]>::new();
+        points.extend([
+            DVec2::new(0.0, 0.0),
+            DVec2::new(1.0, 0.0),
+            DVec2::new(0.0, f64::NAN),
+        ]);
+
+        assert!(directional_shadow_receiver_hull(points).is_none());
+    }
+
+    #[test]
+    fn invalid_camera_transform_uses_native_shadow_culling() {
+        let projection = Projection::Perspective(PerspectiveProjection::default());
+        let world_from_view =
+            GlobalTransform::from(Transform::from_translation(Vec3::splat(f32::NAN)));
+        let mut cascade = Cascade::default();
+        cascade.clip_from_world = Mat4::IDENTITY;
+        cascade.texel_size = 0.1;
+
+        assert!(directional_shadow_receiver_bounds(
+            &projection,
+            &world_from_view,
+            &cascade,
+            1.0,
+            10.0,
+            UVec2::new(2000, 1000),
+            1.0,
+            2.0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn receiver_bounds_include_filter_and_normal_bias_footprints() {
+        let projection = Projection::Perspective(PerspectiveProjection::default());
+        let mut cascade = Cascade::default();
+        cascade.clip_from_world = Mat4::IDENTITY;
+        cascade.texel_size = 0.1;
+        let corners = projection.get_frustum_corners(-1.0, -10.0);
+        let raw_min_x = corners
+            .iter()
+            .map(|corner| f64::from(corner.x))
+            .fold(f64::INFINITY, f64::min);
+        let raw_max_x = corners
+            .iter()
+            .map(|corner| f64::from(corner.x))
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let bounds = directional_shadow_receiver_bounds(
+            &projection,
+            &GlobalTransform::IDENTITY,
+            &cascade,
+            1.0,
+            10.0,
+            UVec2::new(2000, 1000),
+            1.0,
+            2.0,
+        )
+        .unwrap();
+
+        assert!(bounds.min.x <= raw_min_x - 0.38);
+        assert!(bounds.max.x >= raw_max_x + 0.38);
+    }
+
+    #[test]
+    fn frustum_receiver_bounds_cover_half_pixel_temporal_jitter() {
+        let projection = Projection::Perspective(PerspectiveProjection {
+            fov: core::f32::consts::FRAC_PI_2,
+            aspect_ratio: 2.0,
+            ..Default::default()
+        });
+        let viewport_size = UVec2::new(2000, 1000);
+        let original = projection.get_frustum_corners(-1.0, -10.0);
+        let expanded =
+            frustum_corners_with_temporal_jitter_margin(&projection, 1.0, 10.0, viewport_size)
+                .unwrap();
+        let far_width = original[4].x - original[6].x;
+        let expected_x_margin = far_width / viewport_size.x as f32 * 0.5;
+        let far_height = original[5].y - original[4].y;
+        let expected_y_margin = far_height / viewport_size.y as f32 * 0.5;
+
+        assert!(
+            (expanded[4].x - original[4].x - expected_x_margin).abs() < 2e-5,
+            "original={} expanded={} expected_margin={}",
+            original[4].x,
+            expanded[4].x,
+            expected_x_margin,
+        );
+        assert!((original[6].x - expanded[6].x - expected_x_margin).abs() < 2e-5);
+        assert!((original[4].y - expanded[4].y - expected_y_margin).abs() < 2e-5);
+        assert!((expanded[5].y - original[5].y - expected_y_margin).abs() < 2e-5);
+    }
+
+    #[test]
+    fn temporal_filter_uses_native_culling_without_an_extra_bound() {
+        assert_eq!(
+            directional_shadow_filter_radius(ShadowFilteringMethod::Hardware2x2),
+            Some(1.0),
+        );
+        assert_eq!(
+            directional_shadow_filter_radius(ShadowFilteringMethod::Gaussian),
+            Some(3.0),
+        );
+        assert_eq!(
+            directional_shadow_filter_radius(ShadowFilteringMethod::Temporal),
+            None,
+        );
+    }
+
+    #[test]
+    fn directional_filter_support_matches_the_available_shadow_footprint() {
+        let mut light = DirectionalLight::default();
+        assert!(directional_shadow_receiver_culling_supported(&light));
+
+        #[cfg(feature = "experimental_pbr_pcss")]
+        {
+            light.soft_shadow_size = Some(1.0);
+            assert!(!directional_shadow_receiver_culling_supported(&light));
+        }
+    }
 }
