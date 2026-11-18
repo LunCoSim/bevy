@@ -79,6 +79,7 @@ struct Lights {
     /// w is cluster_dimensions.z / (-far - -near)
     cluster_factors: vec4<f32>,
     n_directional_lights: u32,
+    material_response_light_mask: u32,
     spot_light_shadowmap_offset: i32,
     ambient_light_flags: u32,
     n_rect_lights: u32,

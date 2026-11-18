@@ -216,6 +216,7 @@ pub struct GpuLights {
     // w is cluster_dimensions.z * log(near) / log(far / near)
     cluster_factors: Vec4,
     n_directional_lights: u32,
+    material_response_light_mask: u32,
     // offset from spot light's light index to spot light's shadow map index
     spot_light_shadowmap_offset: i32,
     ambient_light_flags: u32,
@@ -333,7 +334,10 @@ pub fn extract_ambient_light(
 pub fn extract_lights(
     mut commands: Commands,
     point_light_shadow_map: Extract<Res<PointLightShadowMap>>,
-    directional_light_shadow_map: Extract<Res<DirectionalLightShadowMap>>,
+    shadow_inputs: Extract<(
+        Res<DirectionalLightShadowMap>,
+        Option<Res<bevy_light::MaterialResponseLight>>,
+    )>,
     point_lights: Extract<
         Query<
             (
@@ -452,8 +456,10 @@ pub fn extract_lights(
     if point_light_shadow_map.is_changed() {
         commands.insert_resource(point_light_shadow_map.clone());
     }
+    let (directional_light_shadow_map, response_light) = &*shadow_inputs;
+    commands.insert_resource(response_light.as_deref().copied().unwrap_or_default());
     if directional_light_shadow_map.is_changed() {
-        commands.insert_resource(directional_light_shadow_map.clone());
+        commands.insert_resource((**directional_light_shadow_map).clone());
     }
 
     // This is the point light shadow map texel size for one face of the cube as a distance of 1.0
@@ -880,7 +886,7 @@ pub fn extract_lights(
             contact_shadows_enabled: directional_light.contact_shadows_enabled,
             shadow_depth_bias: directional_light.shadow_depth_bias,
             // The factor of SQRT_2 is for the worst-case diagonal offset
-            shadow_normal_bias: directional_light.shadow_normal_bias * core::f32::consts::SQRT_2,
+            shadow_normal_bias: directional_light.receiver_normal_bias(),
             cascade_shadow_config: cascade_config.clone(),
             cascades: extracted_cascades,
             frusta: extracted_frusta,
@@ -1071,7 +1077,10 @@ pub fn prepare_lights(
     >,
     ambient_light: Res<GlobalAmbientLight>,
     point_light_shadow_map: Res<PointLightShadowMap>,
-    directional_light_shadow_map: Res<DirectionalLightShadowMap>,
+    (directional_light_shadow_map, response_light): (
+        Res<DirectionalLightShadowMap>,
+        Res<bevy_light::MaterialResponseLight>,
+    ),
     mut shadow_render_phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
     (
         mut max_directional_lights_warning_emitted,
@@ -1762,6 +1771,7 @@ pub fn prepare_lights(
 
         let mut gpu_directional_lights = [GpuDirectionalLight::default(); MAX_DIRECTIONAL_LIGHTS];
         let mut num_directional_cascades_enabled_for_this_view = 0usize;
+        let mut material_response_light_mask = 0u32;
         let mut num_directional_lights_for_this_view = 0usize;
         for (index, light_entity) in directional_light_entities
             .iter()
@@ -1775,8 +1785,10 @@ pub fn prepare_lights(
             .enumerate()
             .take(MAX_DIRECTIONAL_LIGHTS)
         {
-            let light = directional_lights.get(*light_entity).unwrap().2;
-
+            let (_, main_entity, light, _) = directional_lights.get(*light_entity).unwrap();
+            if response_light.0 == Some(**main_entity) {
+                material_response_light_mask = 1 << index;
+            }
             num_directional_lights_for_this_view += 1;
 
             let mut flags = DirectionalLightFlags::NONE;
@@ -1858,6 +1870,7 @@ pub fn prepare_lights(
             ),
             cluster_dimensions: clusters.dimensions.extend(n_clusters),
             n_directional_lights: num_directional_lights_for_this_view as u32,
+            material_response_light_mask,
             // spotlight shadow maps are stored in the directional light array, starting at num_directional_cascades_enabled.
             // the spot lights themselves start in the light array at point_light_count. so to go from light
             // index to shadow map index, we need to subtract point light count and add directional shadowmap count.

@@ -293,6 +293,8 @@ pub enum ShadowFilteringMethod {
     ///
     /// Fast but poor quality.
     Hardware2x2,
+    /// Phase-correct 3×3 tent on directional and spot maps. Cubemaps use hardware comparison.
+    Tent3x3,
     /// Approximates a fixed Gaussian blur, good when TAA isn't in use.
     ///
     /// Good quality, good performance.
@@ -316,6 +318,10 @@ pub enum ShadowFilteringMethod {
     /// [method by Jorge Jimenez for *Call of Duty: Advanced Warfare*]: https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare/
     Temporal,
 }
+
+/// Main-world identity of the directional light selected for a material's direct-light response.
+#[derive(Resource, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterialResponseLight(pub Option<Entity>);
 
 /// System sets used to run light-related systems.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
@@ -461,7 +467,7 @@ pub fn check_dir_light_mesh_visibility(
                                     *far,
                                     viewport_size,
                                     filter_radius,
-                                    directional_light.shadow_normal_bias,
+                                    directional_light.receiver_normal_bias(),
                                 )
                             })
                             .collect::<SmallVec<[Option<DirectionalShadowReceiverBounds>; 4]>>(),
@@ -608,10 +614,12 @@ struct DirectionalShadowReceiverAxis {
     max: f64,
 }
 
-fn directional_shadow_filter_radius(method: ShadowFilteringMethod) -> Option<f64> {
+/// Conservative support in shadow texels for a fixed directional filter.
+pub fn directional_shadow_filter_radius(method: ShadowFilteringMethod) -> Option<f64> {
     match method {
         ShadowFilteringMethod::Hardware2x2 => Some(1.0),
         ShadowFilteringMethod::Gaussian => Some(3.0),
+        ShadowFilteringMethod::Tent3x3 => Some(2.0),
         ShadowFilteringMethod::Temporal => None,
     }
 }
@@ -687,8 +695,7 @@ fn directional_shadow_receiver_bounds(
         clip_from_world.row(1).truncate().length(),
     );
     let padding = scale
-        * (f64::from(cascade.texel_size)
-            * (filter_radius + f64::from(shadow_normal_bias.abs()) * core::f64::consts::SQRT_2));
+        * (f64::from(cascade.texel_size) * (filter_radius + f64::from(shadow_normal_bias.abs())));
     let padding = padding + numerical_padding;
     if !min.is_finite()
         || !max.is_finite()
@@ -1425,7 +1432,11 @@ mod directional_shadow_receiver_tests {
             10.0,
             UVec2::new(2000, 1000),
             1.0,
-            2.0,
+            DirectionalLight {
+                shadow_normal_bias: 2.0,
+                ..Default::default()
+            }
+            .receiver_normal_bias(),
         )
         .unwrap();
 

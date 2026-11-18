@@ -185,15 +185,13 @@ pub struct DirectionalShadowReference {
 /// Persistent axes in receiving-frame coordinates, shared across cameras at a site.
 #[derive(Default)]
 pub struct ShadowFrameBases {
-    axes: HashMap<(Entity, Entity), (Vec3, Vec3, bool)>,
-    patches: HashMap<(Entity, Entity), ShadowPatch>,
+    frames: HashMap<(Entity, Entity), ShadowFrame>,
 }
 
-struct ShadowPatch {
-    frame: Entity,
-    origin: DVec3,
-    offset: DVec2,
-    used: bool,
+struct ShadowFrame {
+    datum: DVec3,
+    right: Vec3,
+    direction: Vec3,
 }
 
 fn transported_right(previous_x: Vec3, previous_z: Vec3, z: Vec3) -> Vec3 {
@@ -211,34 +209,25 @@ impl ShadowFrameBases {
     fn projection_frame(
         &mut self,
         light: Entity,
-        view: Entity,
         reference: DirectionalShadowReference,
         world_z: Vec3,
     ) -> (Mat4, DVec2) {
         let frame = reference.rotation;
         let z = (frame.inverse() * world_z).normalize();
-        let axes = self
-            .axes
+        let state = self
+            .frames
             .entry((light, reference.frame))
-            .or_insert_with(|| (z.any_orthonormal_vector(), z, true));
-        let x = transported_right(axes.0, axes.1, z);
-        *axes = (x, z, true);
+            .or_insert_with(|| ShadowFrame {
+                datum: reference.frame_origin,
+                right: z.any_orthonormal_vector(),
+                direction: z,
+            });
+        let x = transported_right(state.right, state.direction, z);
+        state.right = x;
+        state.direction = z;
         let y = z.cross(x);
-        let patch = self.patches.entry((light, view)).or_insert(ShadowPatch {
-            frame: reference.frame,
-            origin: reference.frame_origin,
-            offset: DVec2::ZERO,
-            used: true,
-        });
-        if patch.frame != reference.frame {
-            patch.frame = reference.frame;
-            patch.offset = DVec2::ZERO;
-        } else if patch.origin != reference.frame_origin {
-            let delta = reference.frame_origin - patch.origin;
-            patch.offset += DVec2::new(delta.dot(x.as_dvec3()), delta.dot(y.as_dvec3()));
-        }
-        patch.origin = reference.frame_origin;
-        patch.used = true;
+        let delta = reference.frame_origin - state.datum;
+        let offset = DVec2::new(delta.dot(x.as_dvec3()), delta.dot(y.as_dvec3()));
         (
             Mat4::from_cols(
                 (frame * x).extend(0.0),
@@ -246,7 +235,7 @@ impl ShadowFrameBases {
                 world_z.extend(0.0),
                 Vec4::W,
             ),
-            patch.offset,
+            offset,
         )
     }
 }
@@ -288,8 +277,10 @@ pub fn build_directional_light_cascades(
         &Projection,
         &Camera,
         Option<&DirectionalShadowReference>,
+        Option<&crate::ShadowFilteringMethod>,
     )>,
     mut bases: Local<ShadowFrameBases>,
+    entities: Query<Entity>,
     mut lights: Query<(
         Entity,
         &GlobalTransform,
@@ -298,21 +289,29 @@ pub fn build_directional_light_cascades(
         &mut Cascades,
     )>,
 ) {
-    let views = views
+    let mut views = views
         .iter()
-        .filter_map(|(entity, transform, projection, camera, reference)| {
-            if camera.is_active {
-                Some((
-                    entity,
-                    projection,
-                    transform.to_matrix(),
-                    reference.copied(),
-                ))
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(entity, transform, projection, camera, reference, filter)| {
+                if camera.is_active {
+                    Some((
+                        entity,
+                        projection,
+                        transform.to_matrix(),
+                        reference.copied(),
+                        filter.copied().unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                }
+            },
+        )
         .collect::<Vec<_>>();
+
+    views.sort_unstable_by_key(|view| view.0);
+    bases
+        .frames
+        .retain(|(light, frame), _| lights.contains(*light) && entities.contains(*frame));
 
     for (light, transform, directional_light, cascades_config, mut cascades) in &mut lights {
         if !directional_light.shadow_maps_enabled {
@@ -327,14 +326,11 @@ pub fn build_directional_light_cascades(
         // `transform.to_matrix()` will give us a matrix with our desired properties.
         // Instead, we directly create a good matrix from just the rotation.
         let native_basis = Mat4::from_quat(transform.rotation());
-        for (view_entity, projection, world_from_view, reference) in views.iter().copied() {
+        for (view_entity, projection, world_from_view, reference, filter) in views.iter().copied() {
             let (world_from_light, offset) = match reference {
-                Some(reference) => bases.projection_frame(
-                    light,
-                    view_entity,
-                    reference,
-                    native_basis.z_axis.truncate(),
-                ),
+                Some(reference) => {
+                    bases.projection_frame(light, reference, native_basis.z_axis.truncate())
+                }
                 None => (native_basis, DVec2::ZERO),
             };
             let anchor = reference.map(|r| r.render_origin);
@@ -361,16 +357,14 @@ pub fn build_directional_light_cascades(
                         world_from_light,
                         light_view_from_camera,
                         anchor.map(|origin| (origin, offset)),
+                        crate::directional_shadow_filter_radius(filter).unwrap_or(0.0) as f32,
+                        directional_light,
                     )
                 })
                 .collect();
             cascades.cascades.insert(view_entity, view_cascades);
         }
     }
-    bases
-        .patches
-        .retain(|_, patch| core::mem::take(&mut patch.used));
-    bases.axes.retain(|_, (_, _, used)| core::mem::take(used));
 }
 
 /// Returns a [`Cascade`] for the frustum defined by `frustum_corners`.
@@ -385,6 +379,8 @@ fn calculate_cascade(
     world_from_light: Mat4,
     light_from_camera: Mat4,
     anchor: Option<(Vec3, DVec2)>,
+    filter_radius: f32,
+    light: &DirectionalLight,
 ) -> Cascade {
     let mut min = Vec3A::splat(f32::MAX);
     let mut max = Vec3A::splat(f32::MIN);
@@ -405,15 +401,15 @@ fn calculate_cascade(
     let far_plane_diagonal = (frustum_corners[4] - frustum_corners[6]).length_squared();
     let cascade_diameter = body_diagonal.max(far_plane_diagonal).sqrt().ceil();
 
-    // Reserve one texel on either side for the center snap in the receiving frame.
-    let cascade_diameter = if anchor.is_some() && cascade_texture_size > 2.0 {
-        cascade_diameter * (cascade_texture_size / (cascade_texture_size - 2.0))
+    // Flooring the center spends up to one texel on one side. The receiver
+    // offset and the filter must still fit after that translation.
+    let normal_bias = light.receiver_normal_bias().abs();
+    let border = 2.0 * (1.0 + filter_radius + normal_bias);
+    let cascade_diameter = if cascade_texture_size > border {
+        cascade_diameter * (cascade_texture_size / (cascade_texture_size - border))
     } else {
         cascade_diameter
     };
-    // NOTE: If we ensure that cascade_texture_size is a power of 2, then as we made cascade_diameter an
-    //       integer, cascade_texel_size is then an integer multiple of a power of 2 and can be
-    //       exactly represented in a floating point value.
     let cascade_texel_size = cascade_diameter / cascade_texture_size;
     // NOTE: For shadow stability it is very important that the near_plane_center is at integer
     //       multiples of the texel size to be exactly representable in a floating point value.
@@ -427,10 +423,8 @@ fn calculate_cascade(
     } else {
         (center.truncate() / cascade_texel_size).floor() * cascade_texel_size
     };
-    let near_plane_center = Vec3A::new(
-        snapped.x, snapped.y, // NOTE: max.z is the near plane for right-handed y-up
-        max.z,
-    );
+    let depth_guard = normal_bias * cascade_texel_size + light.shadow_depth_bias.abs();
+    let near_plane_center = Vec3A::new(snapped.x, snapped.y, max.z + depth_guard);
 
     // It is critical for `cascade_from_world` to be stable. So rather than forming `world_from_cascade`
     // and inverting it, which risks instability due to numerical precision, we directly form
@@ -468,7 +462,7 @@ fn calculate_cascade(
 
     // Right-handed orthographic projection, centered at `near_plane_center`.
     // NOTE: This is different from the reference material, as we use reverse Z.
-    let r = (max.z - min.z).recip();
+    let r = (max.z - min.z + 2.0 * depth_guard).recip();
     let clip_from_cascade = Mat4::from_cols(
         Vec4::new(2.0 / cascade_diameter, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 2.0 / cascade_diameter, 0.0, 0.0),
@@ -492,7 +486,6 @@ mod reference_tests {
     #[test]
     fn reference_grid_survives_rebase_roll_and_patch_handoff() {
         let light = Entity::from_bits(1);
-        let view = Entity::from_bits(2);
         let frame = Entity::from_bits(3);
         let mut bases = ShadowFrameBases::default();
         let z = Vec3::new(0.11, 0.992, 0.05).normalize();
@@ -516,7 +509,7 @@ mod reference_tests {
                 frame_origin: origin.as_dvec3(),
                 render_origin: rotation * origin + shift,
             };
-            let (basis, offset) = bases.projection_frame(light, view, reference, rotation * z);
+            let (basis, offset) = bases.projection_frame(light, reference, rotation * z);
             let camera_local =
                 Mat4::from_rotation_translation(rotation, rotation * (camera - origin));
             let c = calculate_cascade(
@@ -525,11 +518,20 @@ mod reference_tests {
                 basis,
                 basis.transpose() * camera_local,
                 Some((reference.render_origin, offset)),
+                3.0,
+                &DirectionalLight {
+                    shadow_normal_bias: 2.0,
+                    shadow_depth_bias: 0.005,
+                    ..Default::default()
+                },
             );
             for corner in corners {
                 let world = rotation * (camera + Vec3::from(corner)) + shift;
                 let uv = c.clip_from_world.transform_point3(world);
-                assert!(uv.x.abs() <= 1.0001 && uv.y.abs() <= 1.0001);
+                let safe_edge = 1.0 - 2.0 * (3.0 + 2.0 * core::f32::consts::SQRT_2) / 4096.0;
+                assert!(uv.x.abs() <= safe_edge && uv.y.abs() <= safe_edge);
+                let biased = world + basis.z_axis.truncate() * (2.0 * c.texel_size + 0.005);
+                assert!(c.clip_from_world.transform_point3(biased).z <= 1.0001);
                 assert!((-0.0001..=1.0001).contains(&uv.z));
             }
             c.clip_from_world
