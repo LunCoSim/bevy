@@ -15,6 +15,7 @@ use bevy_window::{
     CompositeAlphaMode, PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing,
 };
 use core::num::NonZero;
+use std::sync::Arc;
 use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
@@ -105,14 +106,19 @@ impl ExtractedWindow {
         self.swap_chain_texture_view.is_some() && self.swap_chain_texture.is_some()
     }
 
-    pub fn present(&mut self, queue: &RenderQueue) {
-        if let Some(surface_texture) = self.swap_chain_texture.take() {
-            // TODO(clean): winit docs recommends calling pre_present_notify before this.
-            // though `present()` doesn't present the frame, it schedules it to be presented
-            // by wgpu.
-            // https://docs.rs/winit/0.29.9/wasm32-unknown-unknown/winit/window/struct.Window.html#method.pre_present_notify
-            surface_texture.present(queue);
-        }
+    pub(crate) fn take_presentation(
+        &mut self,
+        surface: &SurfaceData,
+        queue: &RenderQueue,
+    ) -> Option<SurfacePresentation> {
+        self.swap_chain_texture
+            .take()
+            .map(|texture| SurfacePresentation {
+                texture,
+                queue: queue.clone(),
+                _surface: Arc::clone(&surface.surface),
+                _window: surface.window.clone(),
+            })
     }
 }
 
@@ -229,9 +235,58 @@ wgpu_wrapper!(struct WgpuSurface(wgpu::Surface<'static>));
 
 #[derive(Component)]
 pub struct SurfaceData {
-    surface: WgpuSurface,
+    surface: Arc<WgpuSurface>,
+    window: RawHandleWrapper,
     configuration: SurfaceConfiguration,
     texture_view_format: Option<TextureFormat>,
+}
+
+impl SurfaceData {
+    /// Concrete, supported presentation mode configured for this surface.
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.configuration.present_mode
+    }
+}
+
+/// A submitted swapchain texture and the exact surface/window it belongs to.
+/// Its guards permit main-world extraction/retirement while native presentation
+/// is still on the render thread. The render thread never acquires another
+/// texture or reconfigures a surface before presenting this batch.
+pub(crate) struct SurfacePresentation {
+    texture: SurfaceTexture,
+    queue: RenderQueue,
+    _surface: Arc<WgpuSurface>,
+    _window: RawHandleWrapper,
+}
+
+/// One complete render-frame presentation batch. Pipelined rendering takes
+/// this out of the render world before handing that world back to the main
+/// thread. Non-pipelined rendering consumes the same batch synchronously.
+#[derive(Resource, Default)]
+pub(crate) struct PendingSurfacePresentations {
+    pub(crate) frames: Vec<SurfacePresentation>,
+    pub(crate) frame_ready: bool,
+}
+
+impl PendingSurfacePresentations {
+    pub(crate) fn present(self) {
+        if !self.frame_ready {
+            return;
+        }
+        #[cfg(feature = "trace")]
+        let _span = bevy_log::info_span!("present_frames").entered();
+        for frame in self.frames {
+            #[cfg(feature = "trace")]
+            let _span = bevy_log::info_span!("surface_present").entered();
+            frame.texture.present(&frame.queue);
+        }
+        #[cfg(feature = "tracing-tracy")]
+        bevy_log::event!(
+            bevy_log::Level::INFO,
+            message = "finished frame",
+            tracy.frame_mark = true
+        );
+    }
 }
 
 /// (re)configures window surfaces, and obtains a swapchain texture for rendering.
@@ -312,6 +367,8 @@ pub fn prepare_windows(
         };
 
         let surface = &surface_data.surface;
+        #[cfg(feature = "trace")]
+        let _span = bevy_log::info_span!("surface_acquire").entered();
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
@@ -443,7 +500,8 @@ pub fn create_surfaces(
             render_device.configure_surface(&surface, &configuration);
 
             commands.entity(entity).insert(SurfaceData {
-                surface: WgpuSurface::new(surface),
+                surface: Arc::new(WgpuSurface::new(surface)),
+                window: handle.clone(),
                 configuration,
                 texture_view_format,
             });
@@ -506,8 +564,6 @@ fn present_mode(window: &ExtractedWindow, caps: &wgpu::SurfaceCapabilities) -> w
                 window.present_mode, &caps.present_modes
             );
         });
-    if new_present_mode != present_mode && fallbacks.contains(&present_mode) {
-        info!("PresentMode {present_mode:?} requested but not available. Falling back to {new_present_mode:?}");
-    }
+    info!("Surface presentation configured: requested={present_mode:?}, selected={new_present_mode:?}, supported={:?}", caps.present_modes);
     new_present_mode
 }

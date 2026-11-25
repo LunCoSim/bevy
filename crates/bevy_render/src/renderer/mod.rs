@@ -14,7 +14,10 @@ pub(crate) use wgpu_wrapper::wgpu_wrapper;
 use crate::{
     settings::{RenderResources, WgpuSettings, WgpuSettingsPriority},
     sync_world::MainEntity,
-    view::{screenshot::SubmitScreenshotCommandsState, ExtractedWindow, ViewTarget},
+    view::{
+        screenshot::SubmitScreenshotCommandsState, ExtractedWindow, PendingSurfacePresentations,
+        SurfaceData, ViewTarget,
+    },
 };
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::schedule::ScheduleLabel;
@@ -83,7 +86,7 @@ pub fn render_system(
     world: &mut World,
     present_state: &mut SystemState<(
         Query<(&ViewTarget, &ExtractedCamera)>,
-        Query<(MainEntity, &mut ExtractedWindow)>,
+        Query<(MainEntity, &mut ExtractedWindow, &SurfaceData)>,
         Res<RenderQueue>,
     )>,
     screenshot_state: &mut SystemState<SubmitScreenshotCommandsState>,
@@ -108,30 +111,32 @@ pub fn render_system(
 
     {
         #[cfg(feature = "trace")]
-        let _span = info_span!("present_frames").entered();
-
+        let _span = info_span!("prepare_surface_presentations").entered();
+        let mut batch = PendingSurfacePresentations {
+            frame_ready: true,
+            ..Default::default()
+        };
         if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
-            for (window_entity, mut window) in &mut windows {
+            for (window_entity, mut window, surface) in &mut windows {
                 let view_needs_present = views.iter().any(|(view_target, camera)| {
                     matches!(
                         camera.target,
                         Some(NormalizedRenderTarget::Window(w)) if w.entity() == window_entity
                     ) && view_target.needs_present()
                 });
-
                 if view_needs_present || window.needs_initial_present {
-                    window.present(&render_queue);
+                    if let Some(presentation) = window.take_presentation(surface, &render_queue) {
+                        batch.frames.push(presentation);
+                    }
                     window.needs_initial_present = false;
                 }
             }
         }
-
-        #[cfg(feature = "tracing-tracy")]
-        bevy_log::event!(
-            bevy_log::Level::INFO,
-            message = "finished frame",
-            tracy.frame_mark = true
-        );
+        if let Some(mut pending) = world.get_resource_mut::<PendingSurfacePresentations>() {
+            *pending = batch;
+        } else {
+            batch.present();
+        }
     }
 
     crate::view::screenshot::collect_screenshots(world);

@@ -12,7 +12,7 @@ use bevy_ecs::{
 };
 use bevy_tasks::ComputeTaskPool;
 
-use crate::RenderApp;
+use crate::{view::PendingSurfacePresentations, RenderApp};
 
 /// A Label for the sub app that runs the parts of pipelined rendering that need to run on the main thread.
 ///
@@ -29,6 +29,7 @@ pub struct RenderAppChannels {
     render_app_in_render_thread: bool,
     /// Pumped during shutdown so the render app's main-thread tasks can finish.
     main_thread_executor: MainThreadExecutor,
+    render_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RenderAppChannels {
@@ -46,6 +47,7 @@ impl RenderAppChannels {
             render_to_app_receiver,
             render_app_in_render_thread: false,
             main_thread_executor,
+            render_thread: None,
         }
     }
 
@@ -91,6 +93,15 @@ impl Drop for RenderAppChannels {
                 } else {
                     resume_unwind(payload);
                 }
+            }
+        }
+        // Returning a render world is now earlier than native presentation.
+        // Close admission and join the owner before its retained surface/window
+        // leases can outlive application shutdown.
+        self.app_to_render_sender.close();
+        if let Some(thread) = self.render_thread.take() {
+            if thread.join().is_err() {
+                bevy_log::error!("pipelined render thread failed during shutdown");
             }
         }
     }
@@ -169,16 +180,14 @@ impl Plugin for PipelinedRenderingPlugin {
         // clone main thread executor to render world
         let executor = app.world().resource::<MainThreadExecutor>().clone();
         render_app.world_mut().insert_resource(executor.clone());
+        render_app.init_resource::<PendingSurfacePresentations>();
 
         render_to_app_sender.send_blocking(render_app).unwrap();
 
-        app.insert_resource(RenderAppChannels::new(
-            app_to_render_sender,
-            render_to_app_receiver,
-            executor,
-        ));
+        let mut channels =
+            RenderAppChannels::new(app_to_render_sender, render_to_app_receiver, executor);
 
-        std::thread::Builder::new()
+        let render_thread = std::thread::Builder::new()
             .name("Render thread".into())
             .spawn(move || {
                 #[cfg(feature = "trace")]
@@ -203,7 +212,17 @@ impl Plugin for PipelinedRenderingPlugin {
                         render_app.update();
                     }
 
-                    if render_to_app_sender.send_blocking(render_app).is_err() {
+                    let pending = std::mem::take(
+                        &mut *render_app
+                            .world_mut()
+                            .resource_mut::<PendingSurfacePresentations>(),
+                    );
+                    // Extraction can now overlap native swapchain present, but
+                    // this thread still finishes each single bounded batch before
+                    // acquiring another texture or running the next render update.
+                    if !handoff_then_present(&render_to_app_sender, render_app, || {
+                        pending.present()
+                    }) {
                         break;
                     }
                 }
@@ -211,7 +230,21 @@ impl Plugin for PipelinedRenderingPlugin {
                 bevy_log::debug!("exiting pipelined rendering thread");
             })
             .expect("Failed to create render thread");
+        channels.render_thread = Some(render_thread);
+        app.insert_resource(channels);
     }
+}
+
+fn handoff_then_present(
+    sender: &Sender<SubApp>,
+    render_app: SubApp,
+    present: impl FnOnce(),
+) -> bool {
+    if sender.send_blocking(render_app).is_err() {
+        return false;
+    }
+    present();
+    true
 }
 
 // This function waits for the rendering world to be received,
@@ -291,6 +324,27 @@ mod tests {
         // Ensure shutdown encounters pending main-thread work, regardless of scheduling.
         queued_receiver.recv_timeout(TIMEOUT).unwrap();
         (channels, render_thread)
+    }
+
+    #[test]
+    fn render_world_handoff_precedes_native_present_completion() {
+        run_on_main_thread(|| {
+            let (sender, receiver) = async_channel::bounded(1);
+            let (release, wait) = mpsc::channel();
+            let (finished, done) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                assert!(handoff_then_present(&sender, SubApp::new(), || {
+                    wait.recv_timeout(TIMEOUT).unwrap();
+                    finished.send(()).unwrap();
+                }));
+            });
+            let world = block_on(receiver.recv()).unwrap();
+            assert!(done.try_recv().is_err());
+            drop(world);
+            release.send(()).unwrap();
+            done.recv_timeout(TIMEOUT).unwrap();
+            thread.join().unwrap();
+        });
     }
 
     struct NotifyOnDrop(mpsc::Sender<ThreadId>);
