@@ -252,8 +252,10 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
     }
 }
 
-fn clear_screenshots(mut commands: Commands) {
-    commands.despawn_all::<With<Captured>>();
+fn clear_screenshots(mut commands: Commands, captured: Query<Entity, With<Captured>>) {
+    for entity in &captured {
+        commands.entity(entity).try_despawn();
+    }
 }
 
 pub fn trigger_screenshots(
@@ -763,5 +765,23 @@ pub(crate) fn collect_screenshots(world: &mut World) {
         };
 
         AsyncComputeTaskPool::get().spawn(finish).detach();
+    }
+}
+
+#[cfg(test)]
+mod repeat_work_tests {
+    use super::*;
+
+    #[test]
+    fn repeat_work_screenshot_cleanup_only_retires_captured_entities() {
+        let mut app = bevy_app::App::new();
+        app.add_systems(Update, clear_screenshots);
+        let ordinary = app.world_mut().spawn_empty().id();
+        let finished = app.world_mut().spawn(Captured).id();
+        app.update();
+        assert!(app.world().get_entity(finished).is_err());
+        assert!(app.world().get_entity(ordinary).is_ok());
+        app.update();
+        assert!(app.world().get_entity(ordinary).is_ok());
     }
 }

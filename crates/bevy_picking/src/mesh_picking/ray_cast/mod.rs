@@ -24,7 +24,7 @@ use bevy_transform::components::GlobalTransform;
 use tracing::*;
 
 /// How a ray cast should handle [`Visibility`](bevy_camera::visibility::Visibility).
-#[derive(Clone, Copy, Reflect)]
+#[derive(Clone, Copy, Reflect, PartialEq, Eq)]
 #[reflect(Clone)]
 pub enum RayCastVisibility {
     /// Completely ignore visibility checks. Hidden items can still be ray cast against.
