@@ -1123,9 +1123,17 @@ impl LocalShadowView {
     }
 }
 
+struct LocalShadowJob {
+    entity: Entity,
+    point: bool,
+    sphere: Sphere,
+    layers: RenderLayers,
+    frusta: SmallVec<[Frustum; 6]>,
+}
+
 #[derive(Default)]
 struct LocalShadowScratch {
-    queues: Parallel<Vec<(Entity, u8)>>,
+    queues: Parallel<Vec<Vec<(Entity, u8)>>>,
     decisions: Vec<(Entity, u8)>,
     merge: Vec<Entity>,
 }
@@ -1136,6 +1144,7 @@ pub struct LocalShadowVisibilityCache {
     points: EntityHashMap<LocalShadowView>,
     spots: EntityHashMap<LocalShadowView>,
     dirty: Vec<Entity>,
+    jobs: Vec<LocalShadowJob>,
     scratch: LocalShadowScratch,
 }
 
@@ -1182,9 +1191,8 @@ fn local_caster_faces(
     })
 }
 
-fn update_local_shadow_view<'a>(
+fn reconcile_local_shadow_view<'a>(
     view: &mut LocalShadowView,
-    stable: bool,
     dirty: &[Entity],
     scratch: &mut LocalShadowScratch,
     sphere: &Sphere,
@@ -1202,79 +1210,71 @@ fn update_local_shadow_view<'a>(
         )
     };
     scratch.decisions.clear();
+    scratch.decisions.extend(
+        dirty
+            .iter()
+            .map(|&entity| (entity, casters.get(entity).map_or(0, test))),
+    );
     let mut membership_changed = false;
     let union = Arc::make_mut(&mut view.union);
-    if stable && dirty.len() <= casters.iter().len() / 4 {
-        scratch.decisions.extend(
-            dirty
-                .iter()
-                .map(|&entity| (entity, casters.get(entity).map_or(0, test))),
+    if scratch
+        .decisions
+        .iter()
+        .any(|(entity, mask)| union.binary_search(entity).is_ok() != (*mask != 0))
+    {
+        reconcile_sorted_visibility(
+            union,
+            &scratch.decisions,
+            |mask| usize::from(*mask != 0),
+            &mut scratch.merge,
         );
+    }
+    for (face, list) in lists.enumerate() {
+        let bit = 1 << face;
         if scratch
             .decisions
             .iter()
-            .any(|(entity, mask)| union.binary_search(entity).is_ok() != (*mask != 0))
+            .any(|(entity, mask)| list.entities.binary_search(entity).is_ok() != (mask & bit != 0))
         {
             reconcile_sorted_visibility(
-                union,
+                &mut list.entities,
                 &scratch.decisions,
-                |mask| usize::from(*mask != 0),
+                |mask| usize::from(mask & bit != 0),
                 &mut scratch.merge,
             );
-        }
-        for (face, list) in lists.enumerate() {
-            let bit = 1 << face;
-            if scratch.decisions.iter().any(|(entity, mask)| {
-                list.entities.binary_search(entity).is_ok() != (mask & bit != 0)
-            }) {
-                reconcile_sorted_visibility(
-                    &mut list.entities,
-                    &scratch.decisions,
-                    |mask| usize::from(mask & bit != 0),
-                    &mut scratch.merge,
-                );
-                membership_changed = true;
-            }
-        }
-    } else {
-        casters.par_iter().for_each_init(
-            || scratch.queues.borrow_local_mut(),
-            |queue, data| {
-                let entity = data.0;
-                let mask = test(data);
-                if mask != 0 {
-                    queue.push((entity, mask));
-                }
-            },
-        );
-        for queue in scratch.queues.iter_mut() {
-            scratch.decisions.append(queue);
-        }
-        scratch
-            .decisions
-            .sort_unstable_by_key(|(entity, _)| *entity);
-        union.clear();
-        union.extend(scratch.decisions.iter().map(|(entity, _)| *entity));
-        for (face, list) in lists.enumerate() {
-            let selected = || {
-                scratch
-                    .decisions
-                    .iter()
-                    .filter_map(|(entity, mask)| (mask & (1 << face) != 0).then_some(*entity))
-            };
-            if !list.entities.iter().copied().eq(selected()) {
-                list.entities.clear();
-                list.entities.extend(selected());
-                membership_changed = true;
-            }
+            membership_changed = true;
         }
     }
+    membership_changed
+}
 
-    view.center = sphere.center;
-    view.range = sphere.radius;
-    view.layers.clone_from(layers);
-    view.frusta.clear();
-    view.frusta.extend_from_slice(frusta);
+fn publish_full_local_shadow_view<'a>(
+    view: &mut LocalShadowView,
+    job: &LocalShadowJob,
+    origin: Option<Entity>,
+    decisions: &[(Entity, u8)],
+    lists: impl Iterator<Item = &'a mut VisibleMeshEntities>,
+) -> bool {
+    let mut membership_changed = false;
+    let union = Arc::make_mut(&mut view.union);
+    union.clear();
+    union.extend(decisions.iter().map(|(entity, _)| *entity));
+    for (face, list) in lists.enumerate() {
+        let selected = || {
+            decisions
+                .iter()
+                .filter_map(|(entity, mask)| (mask & (1 << face) != 0).then_some(*entity))
+        };
+        if !list.entities.iter().copied().eq(selected()) {
+            list.entities.clear();
+            list.entities.extend(selected());
+            membership_changed = true;
+        }
+    }
+    view.center = job.sphere.center;
+    view.range = job.sphere.radius;
+    view.layers.clone_from(&job.layers);
+    view.frusta.clone_from(&job.frusta);
     view.origin = origin;
     membership_changed
 }
@@ -1321,6 +1321,14 @@ pub fn check_point_light_mesh_visibility(
             )>,
         ),
     >,
+    disabled: Query<
+        Entity,
+        (
+            With<Mesh3d>,
+            Added<bevy_ecs::entity_disabling::Disabled>,
+            Allow<bevy_ecs::entity_disabling::Disabled>,
+        ),
+    >,
     (
         mut removed_mesh,
         mut removed_inherited,
@@ -1333,6 +1341,7 @@ pub fn check_point_light_mesh_visibility(
         mut removed_no_frustum,
         mut removed_range,
         mut removed_visibility,
+        mut enabled,
     ): (
         RemovedComponents<Mesh3d>,
         RemovedComponents<InheritedVisibility>,
@@ -1345,6 +1354,7 @@ pub fn check_point_light_mesh_visibility(
         RemovedComponents<NoFrustumCulling>,
         RemovedComponents<VisibilityRange>,
         RemovedComponents<ViewVisibility>,
+        RemovedComponents<bevy_ecs::entity_disabling::Disabled>,
     ),
     mut camera_query: Query<(Entity, &RenderTarget), With<Camera>>,
     mut shadow_lod_origin_query: Query<Entity, With<ShadowLodOrigin>>,
@@ -1368,7 +1378,8 @@ pub fn check_point_light_mesh_visibility(
             .chain(removed_no_cpu.read())
             .chain(removed_no_frustum.read())
             .chain(removed_range.read())
-            .chain(removed_visibility.read()),
+            .chain(removed_visibility.read())
+            .chain(enabled.read()),
     );
     let origin = get_shadow_lod_origin(
         camera_query.transmute_lens_filtered(),
@@ -1377,7 +1388,9 @@ pub fn check_point_light_mesh_visibility(
     );
     let ranges = visible_entity_ranges.as_deref();
     let mut collected = false;
+    let sparse_limit = casters.iter().len() / 4;
     let mut publication = Vec::new();
+    cache.jobs.clear();
 
     for visible_lights in &visible_point_lights {
         for &light_entity in visible_lights.get(TypeId::of::<ClusterVisibilityClass>()) {
@@ -1401,30 +1414,39 @@ pub fn check_point_light_mesh_visibility(
                             .get(&light_entity)
                             .is_some_and(|view| view.matches(&sphere, layers, frusta, origin));
                     if stable && !collected {
-                        cache.dirty.extend(changed.iter());
+                        cache.dirty.extend(changed.iter().chain(disabled.iter()));
                         cache.dirty.sort_unstable();
                         cache.dirty.dedup();
                         collected = true;
                     }
-                    let view = cache.points.entry(light_entity).or_default();
-                    if !stable || !cache.dirty.is_empty() {
-                        if update_local_shadow_view(
-                            view,
-                            stable,
-                            &cache.dirty,
-                            &mut cache.scratch,
-                            &sphere,
-                            layers,
-                            frusta,
-                            origin,
-                            ranges,
-                            &casters,
-                            lists.bypass_change_detection().iter_mut(),
-                        ) {
+                    if !stable || cache.dirty.len() > sparse_limit {
+                        cache.jobs.push(LocalShadowJob {
+                            entity: light_entity,
+                            point: true,
+                            sphere,
+                            layers: layers.clone(),
+                            frusta: SmallVec::from_slice(frusta),
+                        });
+                    } else {
+                        let view = cache.points.entry(light_entity).or_default();
+                        if !cache.dirty.is_empty()
+                            && reconcile_local_shadow_view(
+                                view,
+                                &cache.dirty,
+                                &mut cache.scratch,
+                                &sphere,
+                                layers,
+                                frusta,
+                                origin,
+                                ranges,
+                                &casters,
+                                lists.bypass_change_detection().iter_mut(),
+                            )
+                        {
                             lists.set_changed();
                         }
+                        publication.push(Arc::clone(&view.union));
                     }
-                    publication.push(Arc::clone(&view.union));
                 } else {
                     cache.points.remove(&light_entity);
                     cache.spots.remove(&light_entity);
@@ -1448,33 +1470,132 @@ pub fn check_point_light_mesh_visibility(
                             .get(&light_entity)
                             .is_some_and(|view| view.matches(&sphere, layers, frusta, origin));
                     if stable && !collected {
-                        cache.dirty.extend(changed.iter());
+                        cache.dirty.extend(changed.iter().chain(disabled.iter()));
                         cache.dirty.sort_unstable();
                         cache.dirty.dedup();
                         collected = true;
                     }
-                    let view = cache.spots.entry(light_entity).or_default();
-                    if !stable || !cache.dirty.is_empty() {
-                        if update_local_shadow_view(
-                            view,
-                            stable,
-                            &cache.dirty,
-                            &mut cache.scratch,
-                            &sphere,
-                            layers,
-                            frusta,
-                            origin,
-                            ranges,
-                            &casters,
-                            core::iter::once(list.bypass_change_detection()),
-                        ) {
+                    if !stable || cache.dirty.len() > sparse_limit {
+                        cache.jobs.push(LocalShadowJob {
+                            entity: light_entity,
+                            point: false,
+                            sphere,
+                            layers: layers.clone(),
+                            frusta: SmallVec::from_slice(frusta),
+                        });
+                    } else {
+                        let view = cache.spots.entry(light_entity).or_default();
+                        if !cache.dirty.is_empty()
+                            && reconcile_local_shadow_view(
+                                view,
+                                &cache.dirty,
+                                &mut cache.scratch,
+                                &sphere,
+                                layers,
+                                frusta,
+                                origin,
+                                ranges,
+                                &casters,
+                                core::iter::once(list.bypass_change_detection()),
+                            )
+                        {
                             list.set_changed();
                         }
+                        publication.push(Arc::clone(&view.union));
                     }
-                    publication.push(Arc::clone(&view.union));
                 } else {
                     cache.spots.remove(&light_entity);
                 }
+            }
+        }
+    }
+    // Moving lights share one parallel archetype traversal. Every caster is
+    // borrowed once, and each worker retains distinct per-light output queues.
+    // The original sphere/OBB/frustum predicates remain the final authority.
+    if !cache.jobs.is_empty() {
+        let jobs = &cache.jobs;
+        let queues = &mut cache.scratch.queues;
+        for thread in queues.iter_mut() {
+            thread.resize_with(jobs.len(), Vec::new);
+        }
+        casters.par_iter().for_each_init(
+            || {
+                let mut thread = queues.borrow_local_mut();
+                thread.resize_with(jobs.len(), Vec::new);
+                thread
+            },
+            |thread, (entity, inherited, mask, aabb, transform, range, no_frustum)| {
+                if !inherited.get()
+                    || (range
+                        && ranges.is_some_and(|ranges| {
+                            origin.is_none_or(|origin| {
+                                !ranges.entity_is_in_range_of_view(entity, origin)
+                            })
+                        }))
+                {
+                    return;
+                }
+                for (index, job) in jobs.iter().enumerate() {
+                    // Range/inherited admission was evaluated once for all local lights.
+                    let faces = local_caster_faces(
+                        entity,
+                        inherited,
+                        mask,
+                        aabb,
+                        transform,
+                        false,
+                        no_frustum,
+                        &job.layers,
+                        &job.sphere,
+                        &job.frusta,
+                        origin,
+                        ranges,
+                    );
+                    if faces != 0 {
+                        thread[index].push((entity, faces));
+                    }
+                }
+            },
+        );
+        for (index, job) in jobs.iter().enumerate() {
+            cache.scratch.decisions.clear();
+            for thread in queues.iter_mut() {
+                cache.scratch.decisions.append(&mut thread[index]);
+            }
+            cache
+                .scratch
+                .decisions
+                .sort_unstable_by_key(|(entity, _)| *entity);
+            if job.point {
+                let Ok((_, _, _, mut lists, _)) = point_lights.get_mut(job.entity) else {
+                    continue;
+                };
+                let view = cache.points.entry(job.entity).or_default();
+                if publish_full_local_shadow_view(
+                    view,
+                    job,
+                    origin,
+                    &cache.scratch.decisions,
+                    lists.bypass_change_detection().iter_mut(),
+                ) {
+                    lists.set_changed();
+                }
+                publication.push(Arc::clone(&view.union));
+            } else {
+                let Ok((_, _, _, mut list, _)) = spot_lights.get_mut(job.entity) else {
+                    continue;
+                };
+                let view = cache.spots.entry(job.entity).or_default();
+                if publish_full_local_shadow_view(
+                    view,
+                    job,
+                    origin,
+                    &cache.scratch.decisions,
+                    core::iter::once(list.bypass_change_detection()),
+                ) {
+                    list.set_changed();
+                }
+                publication.push(Arc::clone(&view.union));
             }
         }
     }
@@ -1774,7 +1895,40 @@ mod directional_shadow_receiver_tests {
             .iter()
             .all(|&e| world.get::<ViewVisibility>(e).unwrap().get()));
 
+        world
+            .entity_mut(spot)
+            .insert(GlobalTransform::from_translation(Vec3::X));
+        world
+            .entity_mut(point)
+            .insert(GlobalTransform::from_translation(Vec3::Z));
+        schedule.run(world);
+        assert_eq!(spot_list(world), initial);
+        assert!(point_list(world).iter().all(|face| face == &initial));
+        assert_eq!(
+            world
+                .entity(spot)
+                .get_ref::<VisibleMeshEntities>()
+                .unwrap()
+                .last_changed(),
+            tick,
+        );
         let first = entities[0];
+        world
+            .entity_mut(first)
+            .insert(bevy_ecs::entity_disabling::Disabled);
+        schedule.run(world);
+        assert!(!spot_list(world).contains(&first));
+        assert!(point_list(world).iter().all(|face| !face.contains(&first)));
+        world
+            .entity_mut(first)
+            .remove::<bevy_ecs::entity_disabling::Disabled>();
+        schedule.run(world);
+        assert_eq!(spot_list(world), initial);
+        let tick = world
+            .entity(spot)
+            .get_ref::<VisibleMeshEntities>()
+            .unwrap()
+            .last_changed();
         world
             .entity_mut(first)
             .insert(GlobalTransform::from_translation(Vec3::X));
