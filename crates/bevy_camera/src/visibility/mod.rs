@@ -746,7 +746,11 @@ fn reset_view_visibility(mut reset_query: Query<&mut ViewVisibility, Without<NoC
 /// To ensure that an entity is checked for visibility, make sure that it has a
 /// [`VisibilityClass`] component and that that component is nonempty.
 pub fn check_visibility_cpu_culling(
-    mut thread_queues: Local<Parallel<TypeIdHashMap<Vec<Entity>>>>,
+    mut thread_queues: Local<Parallel<(TypeIdHashMap<Vec<Entity>>, Vec<Entity>)>>,
+    mut cache: Local<EntityHashMap<CpuVisibilityView>>,
+    mut dirty: Local<Vec<Entity>>,
+    mut decisions: Local<Vec<(Entity, Option<SmallVec<[TypeId; 1]>>)>>,
+    mut scratch: Local<Vec<Entity>>,
     mut view_query: Query<(
         Entity,
         &mut VisibleEntities,
@@ -755,124 +759,320 @@ pub fn check_visibility_cpu_culling(
         &Camera,
         Has<NoCpuCulling>,
     )>,
-    mut visible_aabb_query: Query<
-        (
+    mut candidates: ParamSet<(
+        Query<
             Entity,
-            &InheritedVisibility,
-            &mut ViewVisibility,
-            Option<&VisibilityClass>,
-            Option<&RenderLayers>,
-            Option<&Aabb>,
-            Option<&Sphere>,
-            &GlobalTransform,
-            Has<NoFrustumCulling>,
-            Has<VisibilityRange>,
-        ),
-        Without<NoCpuCulling>,
-    >,
+            (
+                With<InheritedVisibility>,
+                With<ViewVisibility>,
+                With<GlobalTransform>,
+                Or<(
+                    Changed<InheritedVisibility>,
+                    Added<ViewVisibility>,
+                    Changed<VisibilityClass>,
+                    Changed<RenderLayers>,
+                    Changed<Aabb>,
+                    Changed<Sphere>,
+                    Changed<GlobalTransform>,
+                    Added<NoFrustumCulling>,
+                    Added<NoCpuCulling>,
+                    With<VisibilityRange>,
+                )>,
+            ),
+        >,
+        Query<
+            (
+                Entity,
+                &InheritedVisibility,
+                &mut ViewVisibility,
+                Option<&VisibilityClass>,
+                Option<&RenderLayers>,
+                Option<&Aabb>,
+                Option<&Sphere>,
+                &GlobalTransform,
+                Has<NoFrustumCulling>,
+                Has<VisibilityRange>,
+            ),
+            Without<NoCpuCulling>,
+        >,
+    )>,
+    (
+        mut removed_inherited,
+        mut removed_view_visibility,
+        mut removed_class,
+        mut removed_layers,
+        mut removed_aabb,
+        mut removed_sphere,
+        mut removed_transform,
+        mut removed_no_frustum,
+        mut removed_no_cpu,
+        mut removed_range,
+    ): (
+        RemovedComponents<InheritedVisibility>,
+        RemovedComponents<ViewVisibility>,
+        RemovedComponents<VisibilityClass>,
+        RemovedComponents<RenderLayers>,
+        RemovedComponents<Aabb>,
+        RemovedComponents<Sphere>,
+        RemovedComponents<GlobalTransform>,
+        RemovedComponents<NoFrustumCulling>,
+        RemovedComponents<NoCpuCulling>,
+        RemovedComponents<VisibilityRange>,
+    ),
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
+    // An optional-component removal can change eligibility without a Changed tick.
+    dirty.clear();
+    dirty.extend(
+        removed_inherited
+            .read()
+            .chain(removed_view_visibility.read())
+            .chain(removed_class.read())
+            .chain(removed_layers.read())
+            .chain(removed_aabb.read())
+            .chain(removed_sphere.read())
+            .chain(removed_transform.read())
+            .chain(removed_no_frustum.read())
+            .chain(removed_no_cpu.read())
+            .chain(removed_range.read()),
+    );
+    let mut collected = false;
+    cache.retain(|view, _| view_query.get(*view).is_ok());
 
     for (view, mut visible_entities, frustum, maybe_view_mask, camera, no_cpu_culling_camera) in
         &mut view_query
     {
         if !camera.is_active {
+            cache.remove(&view);
+            continue;
+        }
+        let view_mask = maybe_view_mask.unwrap_or_default();
+        let stable = !visible_entities.is_changed()
+            && cache.get(&view).is_some_and(|old| {
+                old.frustum.0 == frustum.0
+                    && old.layers == *view_mask
+                    && old.no_cpu_culling == no_cpu_culling_camera
+            });
+        if stable && !collected {
+            dirty.extend(candidates.p0().iter());
+            dirty.sort_unstable();
+            dirty.dedup();
+            collected = true;
+        }
+        let mut visible_aabb_query = candidates.p1();
+        // The sparse path uses random ECS lookups rather than parallel archetype
+        // iteration. For a broadly changed inventory keep the native bulk pass.
+        if stable && dirty.len() <= visible_aabb_query.iter().len() / 4 {
+            let old = cache.get_mut(&view).unwrap();
+            if !dirty.is_empty() {
+                decisions.clear();
+                for &entity in dirty.iter() {
+                    let result = visible_aabb_query.get_mut(entity).ok().and_then(
+                        |(
+                            _,
+                            inherited,
+                            _,
+                            class,
+                            layers,
+                            aabb,
+                            sphere,
+                            transform,
+                            no_frustum,
+                            range,
+                        )| {
+                            camera_candidate_visible(
+                                entity,
+                                inherited,
+                                layers,
+                                aabb,
+                                sphere,
+                                transform,
+                                no_frustum,
+                                range,
+                                view,
+                                view_mask,
+                                frustum,
+                                no_cpu_culling_camera,
+                                visible_entity_ranges,
+                            )
+                            .then(|| class.map_or_else(SmallVec::new, |class| class.0.clone()))
+                        },
+                    );
+                    decisions.push((entity, result));
+                }
+                reconcile_sorted_visibility(
+                    &mut old.union,
+                    &decisions,
+                    |classes| usize::from(classes.is_some()),
+                    &mut scratch,
+                );
+                // Register newly visible classes, then reconcile existing and new
+                // class lists against exactly the same candidate decisions.
+                for (_, classes) in decisions.iter() {
+                    if let Some(classes) = classes {
+                        for class in classes {
+                            visible_entities.entities.entry(*class).or_default();
+                        }
+                    }
+                }
+                for (class, entities) in &mut visible_entities.entities {
+                    reconcile_sorted_visibility(
+                        entities,
+                        &decisions,
+                        |classes| {
+                            classes.as_ref().map_or(0, |classes| {
+                                classes.iter().filter(|id| *id == class).count()
+                            })
+                        },
+                        &mut scratch,
+                    );
+                }
+            }
+            // ViewVisibility is a per-frame union, not a retained per-view flag.
+            let mut iter = visible_aabb_query.iter_many_mut(old.union.iter()).matched();
+            while let Some((_, _, mut visibility, ..)) = iter.fetch_next() {
+                visibility.set_visible();
+            }
             continue;
         }
 
-        let view_mask = maybe_view_mask.unwrap_or_default();
-
         visible_aabb_query.par_iter_mut().for_each_init(
             || thread_queues.borrow_local_mut(),
-            |queue, query_item| {
-                let (
+            |queue,
+             (
+                entity,
+                inherited,
+                mut visibility,
+                class,
+                layers,
+                aabb,
+                sphere,
+                transform,
+                no_frustum,
+                range,
+            )| {
+                if !camera_candidate_visible(
                     entity,
-                    inherited_visibility,
-                    mut view_visibility,
-                    visibility_class,
-                    maybe_entity_mask,
-                    maybe_model_aabb,
-                    maybe_model_sphere,
+                    inherited,
+                    layers,
+                    aabb,
+                    sphere,
                     transform,
-                    no_frustum_culling,
-                    has_visibility_range,
-                ) = query_item;
-
-                // Skip computing visibility for entities that are configured to be hidden.
-                // ViewVisibility has already been reset in `reset_view_visibility`.
-                if !inherited_visibility.get() {
+                    no_frustum,
+                    range,
+                    view,
+                    view_mask,
+                    frustum,
+                    no_cpu_culling_camera,
+                    visible_entity_ranges,
+                ) {
                     return;
                 }
-
-                let entity_mask = maybe_entity_mask.unwrap_or_default();
-                if !view_mask.intersects(entity_mask) {
-                    return;
-                }
-
-                // If outside of the visibility range, cull.
-                if has_visibility_range
-                    && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                        !visible_entity_ranges.entity_is_in_range_of_view(entity, view)
-                    })
-                {
-                    return;
-                }
-
-                // If we have an aabb or a bounding sphere, do frustum culling
-                if !no_frustum_culling && !no_cpu_culling_camera {
-                    if let Some(model_aabb) = maybe_model_aabb {
-                        let world_from_local = transform.affine();
-                        let model_sphere = Sphere {
-                            center: world_from_local.transform_point3a(model_aabb.center),
-                            radius: transform.radius_vec3a(model_aabb.half_extents),
-                        };
-                        // Do quick sphere-based frustum culling
-                        if !frustum.intersects_sphere(&model_sphere, false) {
-                            return;
-                        }
-                        // Do aabb-based frustum culling
-                        if !frustum.intersects_obb(model_aabb, &world_from_local, true, false) {
-                            return;
-                        }
-                    } else if let Some(model_sphere) = maybe_model_sphere
-                        && !frustum.intersects_sphere(model_sphere, false)
-                    {
-                        // Do sphere-based frustum culling in this case
-                        return;
-                    }
-                }
-
-                view_visibility.set_visible();
-
-                // The visibility class may be None here because AABB gizmos can be enabled via
-                // config without a renderable component being added to the entity. This workaround
-                // allows view visibility to be set for entities without a renderable component, but
-                // still need to render gizmos.
-                if let Some(visibility_class) = visibility_class {
-                    // Add the entity to the queue for all visibility classes the entity is in.
-                    for visibility_class_id in visibility_class.iter() {
-                        queue.entry(*visibility_class_id).or_default().push(entity);
+                visibility.set_visible();
+                queue.1.push(entity);
+                // Visible gizmos may have no visibility class.
+                if let Some(class) = class {
+                    for class in class.iter() {
+                        queue.0.entry(*class).or_default().push(entity);
                     }
                 }
             },
         );
-
+        let old = cache.entry(view).or_default();
+        old.frustum = *frustum;
+        old.layers.clone_from(view_mask);
+        old.no_cpu_culling = no_cpu_culling_camera;
+        old.union.clear();
         visible_entities.clear_all();
-
-        // Drain all the thread queues into the `visible_entities` list.
-        for class_queues in thread_queues.iter_mut() {
-            for (class, entities) in class_queues {
+        for (classes, union) in thread_queues.iter_mut() {
+            old.union.append(union);
+            for (class, entities) in classes {
                 visible_entities.get_mut(*class).append(entities);
             }
         }
-
-        // The list must be sorted in order for the O(n) diffing algorithm that
-        // visibility determination uses to work, so do that now.
-        for visible_entities in visible_entities.entities.values_mut() {
-            visible_entities.sort_unstable();
+        old.union.sort_unstable();
+        for entities in visible_entities.entities.values_mut() {
+            entities.sort_unstable();
         }
     }
+}
+
+/// Retained exact per-camera culling state. The public visibility component
+/// remains the native owner of the class-specific sorted output lists.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct CpuVisibilityView {
+    frustum: Frustum,
+    layers: RenderLayers,
+    no_cpu_culling: bool,
+    union: Vec<Entity>,
+}
+
+#[inline]
+fn camera_candidate_visible(
+    entity: Entity,
+    inherited: &InheritedVisibility,
+    layers: Option<&RenderLayers>,
+    aabb: Option<&Aabb>,
+    sphere: Option<&Sphere>,
+    transform: &GlobalTransform,
+    no_frustum: bool,
+    range: bool,
+    view: Entity,
+    view_mask: &RenderLayers,
+    frustum: &Frustum,
+    no_cpu_culling_camera: bool,
+    ranges: Option<&VisibleEntityRanges>,
+) -> bool {
+    if !inherited.get() || !view_mask.intersects(layers.unwrap_or_default()) {
+        return false;
+    }
+    if range && ranges.is_some_and(|ranges| !ranges.entity_is_in_range_of_view(entity, view)) {
+        return false;
+    }
+    if !no_frustum && !no_cpu_culling_camera {
+        if let Some(aabb) = aabb {
+            let world_from_local = transform.affine();
+            let sphere = Sphere {
+                center: world_from_local.transform_point3a(aabb.center),
+                radius: transform.radius_vec3a(aabb.half_extents),
+            };
+            return frustum.intersects_sphere(&sphere, false)
+                && frustum.intersects_obb(aabb, &world_from_local, true, false);
+        } else if let Some(sphere) = sphere {
+            return frustum.intersects_sphere(sphere, false);
+        }
+    }
+    true
+}
+
+/// Merge sorted, unique candidate decisions into the native sorted visibility
+/// list. Unmentioned candidates retain their membership. Scratch storage is
+/// swapped with the output, so repeated updates reuse both allocations.
+#[doc(hidden)]
+pub fn reconcile_sorted_visibility<T>(
+    entities: &mut Vec<Entity>,
+    decisions: &[(Entity, T)],
+    mut selected: impl FnMut(&T) -> usize,
+    scratch: &mut Vec<Entity>,
+) {
+    if decisions.is_empty() {
+        return;
+    }
+    scratch.clear();
+    let mut previous = entities.iter().copied().peekable();
+    for (entity, value) in decisions {
+        while previous.peek().is_some_and(|old| old < entity) {
+            scratch.push(previous.next().unwrap());
+        }
+        while previous.peek() == Some(entity) {
+            previous.next();
+        }
+        scratch.extend(core::iter::repeat_n(*entity, selected(value)));
+    }
+    scratch.extend(previous);
+    core::mem::swap(entities, scratch);
 }
 
 /// Updates the visibility of entities marked with [`NoCpuCulling`].

@@ -15,7 +15,11 @@ use bevy_camera::{
     },
     Camera, Camera3d, CameraUpdateSystems, Projection, RenderTarget, ShadowLodOrigin,
 };
-use bevy_ecs::{entity::EntityHashSet, prelude::*, system::QueryLens};
+use bevy_ecs::{
+    entity::{EntityHashMap, EntityHashSet},
+    prelude::*,
+    system::QueryLens,
+};
 #[cfg(feature = "bevy_gizmos")]
 use bevy_gizmos::frustum::FrustumGizmoSystems;
 use bevy_log::warn_once;
@@ -24,15 +28,16 @@ use bevy_mesh::Mesh3d;
 use bevy_reflect::prelude::*;
 use bevy_transform::{components::GlobalTransform, TransformSystems};
 use bevy_utils::Parallel;
-use core::{any::TypeId, mem, ops::DerefMut};
+use core::any::TypeId;
 use smallvec::{smallvec, SmallVec};
 
 pub mod cluster;
 use cluster::assign::assign_objects_to_clusters;
 pub use cluster::ClusteredDecal;
 mod ambient_light;
+use alloc::sync::Arc;
 pub use ambient_light::{AmbientLight, GlobalAmbientLight};
-use bevy_camera::visibility::SetViewVisibility;
+use bevy_camera::visibility::{reconcile_sorted_visibility, SetViewVisibility};
 
 mod probe;
 pub use probe::{
@@ -349,6 +354,7 @@ pub fn check_dir_light_mesh_visibility(
     mut commands: Commands,
     mut directional_lights: Query<
         (
+            Entity,
             &DirectionalLight,
             &CascadeShadowConfig,
             &Cascades,
@@ -382,13 +388,77 @@ pub fn check_dir_light_mesh_visibility(
             With<Mesh3d>,
         ),
     >,
+    changed: Query<
+        Entity,
+        (
+            With<Mesh3d>,
+            With<InheritedVisibility>,
+            Or<(
+                Changed<Mesh3d>,
+                Changed<InheritedVisibility>,
+                Changed<RenderLayers>,
+                Changed<Aabb>,
+                Changed<GlobalTransform>,
+                Added<NotShadowCaster>,
+                Added<DirectionalLight>,
+                Added<NoCpuCulling>,
+                Added<NoFrustumCulling>,
+                With<VisibilityRange>,
+            )>,
+        ),
+    >,
+    (
+        mut removed_mesh,
+        mut removed_inherited,
+        mut removed_layers,
+        mut removed_aabb,
+        mut removed_transform,
+        mut removed_not_caster,
+        mut removed_light,
+        mut removed_no_cpu,
+        mut removed_no_frustum,
+        mut removed_range,
+    ): (
+        RemovedComponents<Mesh3d>,
+        RemovedComponents<InheritedVisibility>,
+        RemovedComponents<RenderLayers>,
+        RemovedComponents<Aabb>,
+        RemovedComponents<GlobalTransform>,
+        RemovedComponents<NotShadowCaster>,
+        RemovedComponents<DirectionalLight>,
+        RemovedComponents<NoCpuCulling>,
+        RemovedComponents<NoFrustumCulling>,
+        RemovedComponents<VisibilityRange>,
+    ),
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
     mut defer_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
     mut view_visible_entities_queue: Local<Parallel<Vec<Vec<Entity>>>>,
+    mut cache: Local<EntityHashMap<EntityHashMap<DirectionalVisibilityView>>>,
+    mut dirty: Local<Vec<Entity>>,
+    mut decisions: Local<Vec<(Entity, DirectionalVisibilityDecision)>>,
+    mut scratch: Local<Vec<Entity>>,
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
+    dirty.clear();
+    dirty.extend(
+        removed_mesh
+            .read()
+            .chain(removed_inherited.read())
+            .chain(removed_layers.read())
+            .chain(removed_aabb.read())
+            .chain(removed_transform.read())
+            .chain(removed_not_caster.read())
+            .chain(removed_light.read())
+            .chain(removed_no_cpu.read())
+            .chain(removed_no_frustum.read())
+            .chain(removed_range.read()),
+    );
+    let mut collected = false;
+    let mut publication = Vec::new();
+    cache.retain(|light, _| directional_lights.get(*light).is_ok());
 
     for (
+        light,
         directional_light,
         cascade_config,
         cascades,
@@ -398,34 +468,26 @@ pub fn check_dir_light_mesh_visibility(
         light_view_visibility,
     ) in &mut directional_lights
     {
-        let mut views_to_remove = Vec::new();
-        for (view, cascade_view_entities) in &mut visible_entities.entities {
-            match frusta.frusta.get(view) {
-                Some(view_frusta) => {
-                    cascade_view_entities.resize(view_frusta.len(), Default::default());
-                }
-                None => views_to_remove.push(*view),
-            };
-        }
-        for (view, frusta) in &frusta.frusta {
-            visible_entities
-                .entities
-                .entry(*view)
-                .or_insert_with(|| vec![VisibleMeshEntities::default(); frusta.len()]);
-        }
-
-        for v in views_to_remove {
-            visible_entities.entities.remove(&v);
-        }
-
-        // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
         if !directional_light.shadow_maps_enabled || !light_view_visibility.get() {
             visible_entities.entities.clear();
+            cache.remove(&light);
             continue;
         }
-
         let view_mask = maybe_view_mask.unwrap_or_default();
-
+        let cached_views = cache.entry(light).or_default();
+        if visible_entities.is_changed() {
+            cached_views.clear();
+        }
+        cached_views.retain(|view, _| frusta.frusta.contains_key(view));
+        if visible_entities
+            .entities
+            .keys()
+            .any(|view| !frusta.frusta.contains_key(view))
+        {
+            visible_entities
+                .entities
+                .retain(|view, _| frusta.frusta.contains_key(view));
+        }
         for (view, view_frusta) in &frusta.frusta {
             let receiver_bounds = camera_views
                 .get(*view)
@@ -480,124 +542,210 @@ pub fn check_dir_light_mesh_visibility(
                     bounds
                 });
 
-            // Resize any per-thread buffer left at a stale state from a prior frame.
-            // Threads receiving no work this frame won't run the `init` closure from `par_iter`, and without this
-            // their buffer might be indexed out-of-bounds during collection if the number of cascades has increased.
+            let stable = cached_views.get(view).is_some_and(|old| {
+                old.layers == *view_mask
+                    && old.frusta.len() == view_frusta.len()
+                    && old.frusta.iter().zip(view_frusta).all(|(a, b)| a.0 == b.0)
+                    && old.receiver_bounds == receiver_bounds
+                    && visible_entities
+                        .entities
+                        .get(view)
+                        .is_some_and(|lists| lists.len() == view_frusta.len())
+            });
+            if stable && !collected {
+                dirty.extend(changed.iter());
+                dirty.sort_unstable();
+                dirty.dedup();
+                collected = true;
+            }
+            // For widespread changes the native parallel archetype traversal
+            // costs less than sparse random lookups and merging retained lists.
+            if stable && dirty.len() <= visible_entity_query.iter().len() / 4 {
+                let old = cached_views.get_mut(view).unwrap();
+                if !dirty.is_empty() {
+                    decisions.clear();
+                    for &entity in dirty.iter() {
+                        let mut decision = DirectionalVisibilityDecision::default();
+                        if let Ok((_, inherited, layers, aabb, transform, range, no_frustum)) =
+                            visible_entity_query.get(entity)
+                        {
+                            decision.visible = visit_directional_caster(
+                                entity,
+                                inherited,
+                                layers,
+                                aabb,
+                                transform,
+                                range,
+                                no_frustum,
+                                *view,
+                                view_mask,
+                                view_frusta,
+                                &receiver_bounds,
+                                visible_entity_ranges,
+                                |index| decision.cascades.push(index),
+                            );
+                        }
+                        decisions.push((entity, decision));
+                    }
+                    reconcile_sorted_visibility(
+                        Arc::make_mut(&mut old.union),
+                        &decisions,
+                        |decision| usize::from(decision.visible),
+                        &mut scratch,
+                    );
+                    let lists = visible_entities.entities.get_mut(view).unwrap();
+                    for (index, list) in lists.iter_mut().enumerate() {
+                        reconcile_sorted_visibility(
+                            &mut list.entities,
+                            &decisions,
+                            |decision| usize::from(decision.cascades.contains(&index)),
+                            &mut scratch,
+                        );
+                    }
+                }
+                publication.push(Arc::clone(&old.union));
+                continue;
+            }
+
+            // Native full culling path for changed views and broadly dirty inventories.
             for thread_queue in view_visible_entities_queue.iter_mut() {
                 thread_queue.resize(view_frusta.len(), Vec::default());
             }
-
             visible_entity_query.par_iter().for_each_init(
                 || {
                     let mut entities = view_visible_entities_queue.borrow_local_mut();
                     entities.resize(view_frusta.len(), Vec::default());
                     (defer_visible_entities_queue.borrow_local_mut(), entities)
                 },
-                |(defer_visible_entities_local_queue, view_visible_entities_local_queue),
-                 (
-                    entity,
-                    inherited_visibility,
-                    maybe_entity_mask,
-                    maybe_aabb,
-                    maybe_transform,
-                    has_visibility_range,
-                    has_no_frustum_culling,
-                )| {
-                    if !inherited_visibility.get() {
-                        return;
-                    }
-
-                    let entity_mask = maybe_entity_mask.unwrap_or_default();
-                    if !view_mask.intersects(entity_mask) {
-                        return;
-                    }
-
-                    // Check visibility ranges.
-                    if has_visibility_range
-                        && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                            !visible_entity_ranges.entity_is_in_range_of_view(entity, *view)
-                        })
-                    {
-                        return;
-                    }
-
-                    if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
-                        let mut visible = false;
-                        for (cascade_index, (frustum, frustum_visible_entities)) in view_frusta
-                            .iter()
-                            .zip(view_visible_entities_local_queue.iter_mut())
-                            .enumerate()
-                        {
-                            // Disable near-plane culling, as a shadow caster could lie before the near plane.
-                            if !has_no_frustum_culling
-                                && !frustum.intersects_obb(aabb, &transform.affine(), false, true)
-                            {
-                                continue;
-                            }
-                            if !has_no_frustum_culling
-                                && receiver_bounds[cascade_index].is_some_and(|bounds| {
-                                    aabb_is_outside_directional_shadow_receiver_bounds(
-                                        aabb, transform, &bounds,
-                                    )
-                                })
-                            {
-                                continue;
-                            }
-                            visible = true;
-
-                            frustum_visible_entities.push(entity);
-                        }
-                        if visible {
-                            defer_visible_entities_local_queue.push(entity);
-                        }
-                    } else {
-                        defer_visible_entities_local_queue.push(entity);
-                        for frustum_visible_entities in view_visible_entities_local_queue.iter_mut()
-                        {
-                            frustum_visible_entities.push(entity);
-                        }
+                |(union, lists),
+                 (entity, inherited, layers, aabb, transform, range, no_frustum)| {
+                    if visit_directional_caster(
+                        entity,
+                        inherited,
+                        layers,
+                        aabb,
+                        transform,
+                        range,
+                        no_frustum,
+                        *view,
+                        view_mask,
+                        view_frusta,
+                        &receiver_bounds,
+                        visible_entity_ranges,
+                        |index| lists[index].push(entity),
+                    ) {
+                        union.push(entity);
                     }
                 },
             );
-            // collect entities from parallel queue
-            for (view_dest_index, view_dest) in visible_entities
-                .entities
-                .get_mut(view)
-                .unwrap()
-                .iter_mut()
-                .enumerate()
-            {
-                view_dest.entities.clear();
-                for thread_entity_queue in view_visible_entities_queue.iter_mut() {
-                    view_dest
-                        .entities
-                        .append(&mut thread_entity_queue[view_dest_index]);
-                }
-                view_dest.shrink();
-                view_dest.entities.sort_unstable();
+            let old = cached_views.entry(*view).or_default();
+            old.layers.clone_from(view_mask);
+            old.frusta.clear();
+            old.frusta.extend_from_slice(view_frusta);
+            old.receiver_bounds = receiver_bounds;
+            let union = Arc::make_mut(&mut old.union);
+            union.clear();
+            for thread_union in defer_visible_entities_queue.iter_mut() {
+                union.append(thread_union);
             }
+            union.sort_unstable();
+            let lists = visible_entities.entities.entry(*view).or_default();
+            lists.resize(view_frusta.len(), Default::default());
+            for (index, list) in lists.iter_mut().enumerate() {
+                list.entities.clear();
+                for thread_lists in view_visible_entities_queue.iter_mut() {
+                    list.entities.append(&mut thread_lists[index]);
+                }
+                list.shrink();
+                list.entities.sort_unstable();
+            }
+            publication.push(Arc::clone(&old.union));
         }
     }
 
-    // Defer marking view visibility so this system can run in parallel with check_point_light_mesh_visibility
-    // TODO: use resource to avoid unnecessary memory alloc
-    let mut defer_queue = mem::take(defer_visible_entities_queue.deref_mut());
-    commands.queue(move |world: &mut World| {
-        let mut query = world.query::<&mut ViewVisibility>();
-        for entities in defer_queue.iter_mut() {
-            let mut iter = query.iter_many_mut(world, entities.iter()).matched();
-            while let Some(mut view_visibility) = iter.fetch_next() {
-                view_visibility.set_visible();
+    // ViewVisibility is a per-frame union. Borrow retained immutable membership
+    // through a shared lease instead of rebuilding a per-caster deferred queue.
+    if !publication.is_empty() {
+        commands.queue(move |world: &mut World| {
+            let mut query = world.query::<&mut ViewVisibility>();
+            for entities in publication {
+                let mut iter = query.iter_many_mut(world, entities.iter()).matched();
+                while let Some(mut visibility) = iter.fetch_next() {
+                    visibility.set_visible();
+                }
             }
+        });
+    }
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct DirectionalVisibilityView {
+    layers: RenderLayers,
+    frusta: SmallVec<[Frustum; 4]>,
+    receiver_bounds: SmallVec<[Option<DirectionalShadowReceiverBounds>; 4]>,
+    union: Arc<Vec<Entity>>,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct DirectionalVisibilityDecision {
+    visible: bool,
+    cascades: SmallVec<[usize; 4]>,
+}
+
+#[inline]
+fn visit_directional_caster(
+    entity: Entity,
+    inherited: &InheritedVisibility,
+    layers: Option<&RenderLayers>,
+    aabb: Option<&Aabb>,
+    transform: Option<&GlobalTransform>,
+    range: bool,
+    no_frustum: bool,
+    view: Entity,
+    view_mask: &RenderLayers,
+    frusta: &[Frustum],
+    bounds: &[Option<DirectionalShadowReceiverBounds>],
+    ranges: Option<&VisibleEntityRanges>,
+    mut selected: impl FnMut(usize),
+) -> bool {
+    if !inherited.get() || !view_mask.intersects(layers.unwrap_or_default()) {
+        return false;
+    }
+    if range && ranges.is_some_and(|ranges| !ranges.entity_is_in_range_of_view(entity, view)) {
+        return false;
+    }
+    if let (Some(aabb), Some(transform)) = (aabb, transform) {
+        let mut visible = false;
+        let affine = transform.affine();
+        for (index, frustum) in frusta.iter().enumerate() {
+            // Directional casters can be upstream of the receiver's near plane.
+            if !no_frustum
+                && (!frustum.intersects_obb(aabb, &affine, false, true)
+                    || bounds[index].is_some_and(|bounds| {
+                        aabb_is_outside_directional_shadow_receiver_bounds(aabb, transform, &bounds)
+                    }))
+            {
+                continue;
+            }
+            visible = true;
+            selected(index);
         }
-    });
+        visible
+    } else {
+        for index in 0..frusta.len() {
+            selected(index);
+        }
+        true
+    }
 }
 
 /// Conservative screen-receiver bounds in directional-light clip space.
 ///
 /// Directional casters may be arbitrarily far upstream of a receiver, so the
 /// bounds constrain only light-space X/Y. Z is deliberately unbounded here.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct DirectionalShadowReceiverBounds {
     clip_from_world: DMat4,
     axes: [DirectionalShadowReceiverAxis; 8],
@@ -607,7 +755,7 @@ struct DirectionalShadowReceiverBounds {
     padding: DVec2,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct DirectionalShadowReceiverAxis {
     direction: DVec2,
     min: f64,
@@ -1223,6 +1371,259 @@ mod directional_shadow_receiver_tests {
     use bevy_camera::PerspectiveProjection;
     use bevy_math::{Mat4, Vec3, Vec3A};
     use bevy_transform::components::Transform;
+
+    #[test]
+    fn incremental_camera_visibility_reapplies_union_and_reconciles_sources() {
+        use bevy_camera::visibility::{check_visibility_cpu_culling, VisibilityClass};
+        let mut app = App::new();
+        app.add_plugins(bevy_app::TaskPoolPlugin::default());
+        let world = app.world_mut();
+        let view = world
+            .spawn((
+                Camera::default(),
+                Frustum::default(),
+                VisibleEntities::default(),
+            ))
+            .id();
+        let mut entities = Vec::new();
+        let class = TypeId::of::<Mesh3d>();
+        for _ in 0..16 {
+            entities.push(
+                world
+                    .spawn((
+                        InheritedVisibility::VISIBLE,
+                        ViewVisibility::HIDDEN,
+                        GlobalTransform::IDENTITY,
+                        NoFrustumCulling,
+                        VisibilityClass(smallvec![class]),
+                    ))
+                    .id(),
+            );
+        }
+        let mut schedule = Schedule::default();
+        schedule.add_systems(check_visibility_cpu_culling);
+        schedule.run(world);
+        let initial = world
+            .get::<VisibleEntities>(view)
+            .unwrap()
+            .get(class)
+            .to_vec();
+        assert_eq!(initial.len(), entities.len());
+        let initial_tick = world
+            .entity(view)
+            .get_ref::<VisibleEntities>()
+            .unwrap()
+            .last_changed();
+        for &entity in &entities {
+            *world
+                .get_mut::<ViewVisibility>(entity)
+                .unwrap()
+                .bypass_change_detection() = ViewVisibility::HIDDEN;
+        }
+        schedule.run(world);
+        assert_eq!(
+            world
+                .entity(view)
+                .get_ref::<VisibleEntities>()
+                .unwrap()
+                .last_changed(),
+            initial_tick
+        );
+        assert!(entities
+            .iter()
+            .all(|&entity| world.get::<ViewVisibility>(entity).unwrap().get()));
+
+        let first = entities[0];
+        world.entity_mut(first).insert(RenderLayers::layer(1));
+        *world
+            .get_mut::<ViewVisibility>(first)
+            .unwrap()
+            .bypass_change_detection() = ViewVisibility::HIDDEN;
+        schedule.run(world);
+        assert!(!world
+            .get::<VisibleEntities>(view)
+            .unwrap()
+            .get(class)
+            .contains(&first));
+        assert!(!world.get::<ViewVisibility>(first).unwrap().get());
+        world.entity_mut(first).remove::<RenderLayers>();
+        schedule.run(world);
+        assert_eq!(
+            world.get::<VisibleEntities>(view).unwrap().get(class),
+            initial
+        );
+        world
+            .entity_mut(first)
+            .insert(VisibilityClass(smallvec![class, class]));
+        schedule.run(world);
+        assert_eq!(
+            world
+                .get::<VisibleEntities>(view)
+                .unwrap()
+                .get(class)
+                .iter()
+                .filter(|&&entity| entity == first)
+                .count(),
+            2
+        );
+        world.entity_mut(first).insert(NoCpuCulling);
+        schedule.run(world);
+        assert!(!world
+            .get::<VisibleEntities>(view)
+            .unwrap()
+            .get(class)
+            .contains(&first));
+        world.entity_mut(first).remove::<NoCpuCulling>();
+        schedule.run(world);
+        assert_eq!(
+            world
+                .get::<VisibleEntities>(view)
+                .unwrap()
+                .get(class)
+                .iter()
+                .filter(|&&entity| entity == first)
+                .count(),
+            2
+        );
+        world.despawn(first);
+        schedule.run(world);
+        assert!(!world
+            .get::<VisibleEntities>(view)
+            .unwrap()
+            .get(class)
+            .contains(&first));
+        world.entity_mut(view).insert(RenderLayers::layer(1));
+        schedule.run(world);
+        assert!(world
+            .get::<VisibleEntities>(view)
+            .unwrap()
+            .get(class)
+            .is_empty());
+    }
+
+    #[test]
+    fn incremental_directional_visibility_reapplies_union_and_reconciles_sources() {
+        let mut app = App::new();
+        app.add_plugins(bevy_app::TaskPoolPlugin::default());
+        let world = app.world_mut();
+        let view = world.spawn_empty().id();
+        let light = world
+            .spawn((
+                DirectionalLight {
+                    shadow_maps_enabled: true,
+                    ..Default::default()
+                },
+                ViewVisibility::VISIBLE,
+                CascadesFrusta {
+                    frusta: [(view, vec![Frustum::default(), Frustum::default()])]
+                        .into_iter()
+                        .collect(),
+                },
+            ))
+            .id();
+        let entities: Vec<_> = (0..16)
+            .map(|_| {
+                world
+                    .spawn((
+                        Mesh3d(Default::default()),
+                        InheritedVisibility::VISIBLE,
+                        ViewVisibility::HIDDEN,
+                        NoFrustumCulling,
+                        GlobalTransform::IDENTITY,
+                    ))
+                    .id()
+            })
+            .collect();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(check_dir_light_mesh_visibility);
+        schedule.run(world);
+        let list = |world: &World| {
+            world
+                .get::<CascadesVisibleEntities>(light)
+                .unwrap()
+                .entities[&view][0]
+                .entities
+                .clone()
+        };
+        let initial = list(world);
+        assert_eq!(initial.len(), entities.len());
+        let initial_tick = world
+            .entity(light)
+            .get_ref::<CascadesVisibleEntities>()
+            .unwrap()
+            .last_changed();
+        for &entity in &entities {
+            *world
+                .get_mut::<ViewVisibility>(entity)
+                .unwrap()
+                .bypass_change_detection() = ViewVisibility::HIDDEN;
+        }
+        schedule.run(world);
+        assert_eq!(
+            world
+                .entity(light)
+                .get_ref::<CascadesVisibleEntities>()
+                .unwrap()
+                .last_changed(),
+            initial_tick
+        );
+        assert!(entities
+            .iter()
+            .all(|&entity| world.get::<ViewVisibility>(entity).unwrap().get()));
+        let first = entities[0];
+        world.entity_mut(first).insert(NotShadowCaster);
+        *world
+            .get_mut::<ViewVisibility>(first)
+            .unwrap()
+            .bypass_change_detection() = ViewVisibility::HIDDEN;
+        schedule.run(world);
+        assert!(!list(world).contains(&first));
+        assert!(!world.get::<ViewVisibility>(first).unwrap().get());
+        world.entity_mut(first).remove::<NotShadowCaster>();
+        schedule.run(world);
+        assert_eq!(list(world), initial);
+        world.entity_mut(first).insert(RenderLayers::layer(1));
+        schedule.run(world);
+        assert!(!list(world).contains(&first));
+        world.entity_mut(first).remove::<RenderLayers>();
+        schedule.run(world);
+        assert_eq!(list(world), initial);
+        world.despawn(first);
+        schedule.run(world);
+        assert!(!list(world).contains(&first));
+        world
+            .get_mut::<DirectionalLight>(light)
+            .unwrap()
+            .shadow_maps_enabled = false;
+        schedule.run(world);
+        assert!(world
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities
+            .is_empty());
+        world
+            .get_mut::<DirectionalLight>(light)
+            .unwrap()
+            .shadow_maps_enabled = true;
+        schedule.run(world);
+        assert_eq!(list(world).len(), entities.len() - 1);
+        world
+            .get_mut::<CascadesFrusta>(light)
+            .unwrap()
+            .frusta
+            .get_mut(&view)
+            .unwrap()
+            .pop();
+        schedule.run(world);
+        assert_eq!(
+            world
+                .get::<CascadesVisibleEntities>(light)
+                .unwrap()
+                .entities[&view]
+                .len(),
+            1
+        );
+    }
 
     fn receiver_bounds(min: DVec2, max: DVec2) -> DirectionalShadowReceiverBounds {
         receiver_hull(
