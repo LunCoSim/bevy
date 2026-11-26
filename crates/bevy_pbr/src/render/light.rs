@@ -353,6 +353,7 @@ pub fn extract_lights(
             ),
             Or<(
                 Changed<PointLight>,
+                Changed<RenderEntity>,
                 Changed<CubemapVisibleEntities>,
                 Changed<GlobalTransform>,
                 Changed<ViewVisibility>,
@@ -377,6 +378,7 @@ pub fn extract_lights(
             ),
             Or<(
                 Changed<SpotLight>,
+                Changed<RenderEntity>,
                 Changed<VisibleMeshEntities>,
                 Changed<GlobalTransform>,
                 Changed<ViewVisibility>,
@@ -407,6 +409,7 @@ pub fn extract_lights(
                 Without<SpotLight>,
                 Or<(
                     Changed<DirectionalLight>,
+                    Changed<RenderEntity>,
                     Changed<CascadesVisibleEntities>,
                     Changed<Cascades>,
                     Changed<CascadeShadowConfig>,
@@ -433,10 +436,25 @@ pub fn extract_lights(
             ),
             Or<(
                 Changed<RectLight>,
+                Changed<RenderEntity>,
                 Changed<GlobalTransform>,
                 Changed<ViewVisibility>,
                 Changed<RenderLayers>,
             )>,
+        >,
+    >,
+    // The delta queries above do not enumerate unchanged lights. Shadow-table
+    // retirement must use the complete live source inventory instead.
+    shadow_sources: Extract<
+        Query<
+            (
+                RenderEntity,
+                &ViewVisibility,
+                Option<&PointLight>,
+                Option<&SpotLight>,
+                Option<&DirectionalLight>,
+            ),
+            Or<(With<PointLight>, With<SpotLight>, With<DirectionalLight>)>,
         >,
     >,
     visibility_extraction_system_param: VisibilityExtractionSystemParam,
@@ -472,6 +490,15 @@ pub fn extract_lights(
     let point_light_texel_size = 2.0 / point_light_shadow_map.size as f32;
 
     all_lights_found.clear();
+    for (entity, visibility, point, spot, directional) in &shadow_sources {
+        if visibility.get()
+            && (point.is_some_and(|light| light.shadow_maps_enabled && light.intensity != 0.0)
+                || spot.is_some_and(|light| light.shadow_maps_enabled && light.intensity != 0.0)
+                || (spot.is_none() && directional.is_some_and(|light| light.shadow_maps_enabled)))
+        {
+            all_lights_found.insert(entity);
+        }
+    }
 
     // Zero-output lights cannot illuminate or cast a shadow. Remove their extracted
     // components without changing main-world visibility so Changed<Light> restores
@@ -514,8 +541,6 @@ pub fn extract_lights(
                     RenderShadowMapVisibleEntities::default(),
                 ),
             };
-
-            all_lights_found.insert(render_entity);
 
             for face_index in 0..6 {
                 let retained_view_entity = RetainedViewEntity {
@@ -646,8 +671,6 @@ pub fn extract_lights(
                     RenderShadowMapVisibleEntities::default(),
                 ),
             };
-
-            all_lights_found.insert(render_entity);
 
             let retained_view_entity = RetainedViewEntity {
                 main_entity: MainEntity::from(main_entity),
@@ -798,8 +821,6 @@ pub fn extract_lights(
                 ),
             };
 
-            all_lights_found.insert(render_entity);
-
             for (e, v) in cascades.cascades.iter() {
                 if let Ok(entity) = mapper.get(*e) {
                     extracted_cascades.insert(**entity, v.clone());
@@ -921,8 +942,6 @@ pub fn extract_lights(
             continue;
         }
 
-        all_lights_found.insert(render_entity);
-
         let affine = transform.affine();
         let effective_width = rect_light.width * affine.matrix3.x_axis.length();
         let effective_height = rect_light.height * affine.matrix3.y_axis.length();
@@ -944,8 +963,8 @@ pub fn extract_lights(
         ));
     }
 
-    // Clear out any shadow maps that correspond to lights that have become
-    // invisible or have their shadow mapping turned off.
+    // Retire only tables whose authoritative source is no longer admitted.
+    // Unchanged lights keep their existing extracted candidates and native lists.
     for (render_entity, _, _) in existing_render_shadow_map_visible_entities
         .iter()
         .filter(|(render_entity, _, _)| !all_lights_found.contains(render_entity))
@@ -3402,10 +3421,61 @@ mod zero_output_tests {
                     active
                 );
             }
+            // A frame with no changed light or membership still owns its exact
+            // shadow tables. The delta extraction must not retire these rows.
+            schedule.run(&mut render_world);
+            for entity in [point_render, spot_render] {
+                assert_eq!(
+                    render_world
+                        .get::<RenderExtractedShadowMapVisibleEntities>(entity)
+                        .is_some(),
+                    active
+                );
+                assert_eq!(
+                    render_world
+                        .get::<RenderShadowMapVisibleEntities>(entity)
+                        .is_some(),
+                    active
+                );
+            }
             let main = render_world.resource::<MainWorld>();
             for entity in [point, spot, rect] {
                 assert!(main.get::<ViewVisibility>(entity).unwrap().get());
             }
+        }
+        {
+            let mut main = render_world.resource_mut::<MainWorld>();
+            main.get_mut::<PointLight>(point).unwrap().intensity = 100.0;
+            main.get_mut::<SpotLight>(spot).unwrap().intensity = 100.0;
+        }
+        schedule.run(&mut render_world);
+        {
+            let mut main = render_world.resource_mut::<MainWorld>();
+            main.get_mut::<PointLight>(point)
+                .unwrap()
+                .shadow_maps_enabled = false;
+            main.get_mut::<SpotLight>(spot).unwrap().shadow_maps_enabled = false;
+        }
+        schedule.run(&mut render_world);
+        for entity in [point_render, spot_render] {
+            assert!(render_world.get::<ExtractedPointLight>(entity).is_some());
+            assert!(render_world
+                .get::<RenderShadowMapVisibleEntities>(entity)
+                .is_none());
+        }
+        {
+            let mut main = render_world.resource_mut::<MainWorld>();
+            main.get_mut::<PointLight>(point)
+                .unwrap()
+                .shadow_maps_enabled = true;
+            main.get_mut::<SpotLight>(spot).unwrap().shadow_maps_enabled = true;
+        }
+        schedule.run(&mut render_world);
+        schedule.run(&mut render_world);
+        for entity in [point_render, spot_render] {
+            assert!(render_world
+                .get::<RenderShadowMapVisibleEntities>(entity)
+                .is_some());
         }
     }
 }
