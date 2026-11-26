@@ -574,6 +574,15 @@ where
         offset / u64::from(T::min_size()) as usize
     }
 
+    /// Re-encodes an existing element at its shader-array offset.
+    pub(super) fn set_ref(&mut self, index: usize, value: &T) {
+        let element_size = u64::from(T::min_size()) as usize;
+        let offset = index * element_size;
+        let mut dest = &mut self.data[offset..offset + element_size];
+        dest.fill(0);
+        value.write_into(&mut Writer::new(value, &mut dest, 0).unwrap());
+    }
+
     /// Changes the debugging label of the buffer.
     ///
     /// The next time the buffer is updated (via [`Self::reserve`]), Bevy will inform
@@ -661,11 +670,11 @@ where
             return Err(WriteBufferRangeError::NoValuesToUpload);
         }
         let item_size = u64::from(T::min_size()) as usize;
-        if range.end > item_size * self.capacity {
+        if range.start > range.end || range.end > self.capacity || range.end > self.len() {
             return Err(WriteBufferRangeError::RangeBiggerThanBuffer);
         }
         if let Some(buffer) = &self.buffer {
-            let bytes = &self.data[range.start..range.end];
+            let bytes = &self.data[range.start * item_size..range.end * item_size];
             render_queue.write_buffer(buffer, (range.start * item_size) as u64, bytes);
             Ok(())
         } else {
@@ -1044,7 +1053,7 @@ mod tests {
             vector: bevy_math::Vec3::new(1.0, 2.0, 4.0),
         };
         let value = make();
-        let mut buffer = GpuArrayBuffer::<Element>::Storage(BufferVec::new(BufferUsages::STORAGE));
+        let mut buffer = GpuArrayBuffer::<Element>::new(&wgpu::Limits::default());
         let a = buffer.push(&value);
         let b = buffer.push(make());
         assert_eq!(a.index, 0);
@@ -1055,15 +1064,18 @@ mod tests {
             unreachable!()
         };
         let stride = Element::min_size().get() as usize;
-        assert_eq!(&storage.data[..stride], &storage.data[stride..]);
-        assert_eq!(storage.data.len(), stride * 2);
-        let capacity = storage.data.capacity();
+        assert_eq!(
+            &storage.buffer.data[..stride],
+            &storage.buffer.data[stride..]
+        );
+        assert_eq!(storage.buffer.data.len(), stride * 2);
+        let capacity = storage.buffer.data.capacity();
         buffer.clear();
         assert_eq!(buffer.push(&value).index, 0);
         let GpuArrayBuffer::Storage(storage) = &buffer else {
             unreachable!()
         };
-        assert_eq!(storage.data.capacity(), capacity);
+        assert_eq!(storage.buffer.data.capacity(), capacity);
 
         // On devices without storage buffers, the dynamic-uniform array owns
         // its entries, so borrowed elements are cloned only at that boundary.

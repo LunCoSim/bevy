@@ -1235,7 +1235,8 @@ pub enum RenderMeshInstances {
 pub struct RenderMeshInstancesCpu {
     indices: MainEntityHashMap<usize>,
     instances: Vec<(MainEntity, RenderMeshInstanceCpu)>,
-    prepared: Vec<PreparedCpuMeshInstance>,
+    prepared: Vec<Option<PreparedCpuMeshInstance>>,
+    prepared_inputs: Vec<Option<CpuMeshPreparationInputs>>,
     /// CPU motion flags are recomputed every render frame, even for retained rows.
     motion_flagged_entities: Vec<MainEntity>,
     extraction_initialized: bool,
@@ -1312,12 +1313,12 @@ impl RenderMeshInstancesCpu {
         self.indices.clear();
         self.instances.clear();
         self.prepared.clear();
+        self.prepared_inputs.clear();
         self.motion_flagged_entities.clear();
         self.extraction_initialized = false;
     }
 
     fn begin_frame(&mut self) {
-        self.prepared.clear();
         // Only touch rows whose transient flags were set last frame.
         for entity in self.motion_flagged_entities.drain(..) {
             if let Some(&index) = self.indices.get(&entity) {
@@ -1332,6 +1333,8 @@ impl RenderMeshInstancesCpu {
             return;
         };
         self.instances.swap_remove(index);
+        self.prepared.swap_remove(index);
+        self.prepared_inputs.swap_remove(index);
         if let Some((moved, _)) = self.instances.get(index) {
             // A dense swap preserves the exact main-world identity of the row.
             *self
@@ -1350,16 +1353,34 @@ impl RenderMeshInstancesCpu {
 
     fn insert(&mut self, entity: MainEntity, instance: RenderMeshInstanceCpu) {
         match self.indices.entry(entity) {
-            Entry::Occupied(entry) => self.instances[*entry.get()].1 = instance,
+            Entry::Occupied(entry) => {
+                let index = *entry.get();
+                // Change ticks can report writes of identical transforms. The
+                // prepared uniform depends on the bits, not the write event.
+                let old = &self.instances[index].1.transforms;
+                let new = &instance.transforms;
+                if old.flags != new.flags
+                    || bytemuck::bytes_of(&old.world_from_local)
+                        != bytemuck::bytes_of(&new.world_from_local)
+                    || bytemuck::bytes_of(&old.previous_world_from_local)
+                        != bytemuck::bytes_of(&new.previous_world_from_local)
+                {
+                    self.prepared[index] = None;
+                    self.prepared_inputs[index] = None;
+                }
+                self.instances[index].1 = instance;
+            }
             Entry::Vacant(entry) => {
                 entry.insert(self.instances.len());
                 self.instances.push((entity, instance));
+                self.prepared.push(None);
+                self.prepared_inputs.push(None);
             }
         }
     }
 
     fn prepared_instance(&self, entity: &MainEntity) -> Option<&PreparedCpuMeshInstance> {
-        self.prepared.get(*self.indices.get(entity)?)
+        self.prepared.get(*self.indices.get(entity)?)?.as_ref()
     }
 
     fn mesh_asset_id(&self, entity: MainEntity) -> Option<AssetId<Mesh>> {
@@ -3111,7 +3132,7 @@ pub struct MeshBatchSetCompareData {
     lightmap_slab: Option<NonMaxU32>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct CpuMeshInstanceFacts {
     lightmap: Option<(LightmapSlotIndex, Rect)>,
     lightmap_slab: Option<NonMaxU32>,
@@ -3119,7 +3140,20 @@ struct CpuMeshInstanceFacts {
     morph_descriptor_index: Option<MorphDescriptorIndex>,
 }
 
+/// Independent inputs that may change even if the extracted mesh row did not.
+#[derive(Clone, Copy, PartialEq)]
+struct CpuMeshPreparationInputs {
+    mesh_id: AssetId<Mesh>,
+    allocation: MeshUniformAllocation,
+    facts: CpuMeshInstanceFacts,
+    material_group: MaterialBindGroupIndex,
+    material_slot: MaterialBindGroupSlot,
+    tag: u32,
+    batchable: bool,
+}
+
 struct PreparedCpuMeshInstance {
+    revision: GpuArrayElementRevision,
     uniform: MeshUniform,
     sorted_compare: Option<(MeshBatchSetCompareData, AssetId<Mesh>)>,
     has_mesh_slabs: bool,
@@ -3145,15 +3179,27 @@ impl RenderMeshInstancesCpu {
         mut resolve_mesh: impl FnMut(&AssetId<Mesh>) -> MeshUniformAllocation,
         mut resolve_instance: impl FnMut(MainEntity) -> CpuMeshInstanceFacts,
     ) {
-        // Preserve the extraction owner's dense indices and write the frame's
-        // uniforms in the same order. No second entity hash table is needed.
-        self.prepared.clear();
-        self.prepared.reserve(self.instances.len());
-        for (entity, instance) in &self.instances {
+        // Keep prepared rows aligned with the extraction owner's dense index.
+        // Extraction invalidates changed transform bits; independent render-world
+        // owners must still be checked after their same-frame preparation. The
+        // compact input vector avoids touching cold uniform bytes on a cache hit.
+        for (index, (entity, instance)) in self.instances.iter().enumerate() {
             let mesh_id = instance.mesh_asset_id();
             let allocation = resolve_mesh(&mesh_id);
             let facts = resolve_instance(*entity);
             let material = instance.material_bindings_index();
+            let inputs = CpuMeshPreparationInputs {
+                mesh_id,
+                allocation,
+                facts,
+                material_group: material.group,
+                material_slot: material.slot,
+                tag: instance.tag(),
+                batchable: instance.should_batch(),
+            };
+            if self.prepared_inputs[index] == Some(inputs) {
+                continue;
+            }
             let uniform = MeshUniform::new(
                 &instance.transforms,
                 allocation.first_vertex_index,
@@ -3174,7 +3220,9 @@ impl RenderMeshInstancesCpu {
                     mesh_id,
                 ))
             });
-            self.prepared.push(PreparedCpuMeshInstance {
+            self.prepared_inputs[index] = Some(inputs);
+            self.prepared[index] = Some(PreparedCpuMeshInstance {
+                revision: GpuArrayElementRevision::next(),
                 uniform,
                 sorted_compare,
                 has_mesh_slabs: allocation.mesh_slabs.is_some(),
@@ -3235,7 +3283,12 @@ impl GetBatchData for MeshPipeline {
             error!("`get_batch_data` should never be called in GPU mesh uniform building mode");
             return None;
         };
-        instances.prepared_instance(&main_entity)?.sorted_batch()
+        let prepared = instances.prepared_instance(&main_entity)?;
+        let (uniform, compare) = prepared.sorted_batch()?;
+        Some((
+            RetainedGpuArrayElement::new(uniform, prepared.revision),
+            compare,
+        ))
     }
 }
 
@@ -3286,7 +3339,11 @@ impl GetFullBatchData for MeshPipeline {
             );
             return None;
         };
-        Some(&instances.prepared_instance(&main_entity)?.uniform)
+        let prepared = instances.prepared_instance(&main_entity)?;
+        Some(RetainedGpuArrayElement::new(
+            &prepared.uniform,
+            prepared.revision,
+        ))
     }
 
     fn get_binned_index(
@@ -5478,6 +5535,78 @@ mod tests {
             assert_eq!(actual.metadata_index, expected.metadata_index);
         }
         assert!(b_prepared.sorted_batch().unwrap().1.is_none());
+        let a_revision = a_prepared.revision;
+        let b_revision = b_prepared.revision;
+        instances.begin_frame();
+        instances.insert(a, make_instance(false));
+        instances.prepare_uniforms(|_| allocation, |_| facts);
+        assert_eq!(
+            instances.prepared_instance(&a).unwrap().revision,
+            a_revision
+        );
+        assert_eq!(
+            instances.prepared_instance(&b).unwrap().revision,
+            b_revision
+        );
+
+        let mut moved = make_instance(false);
+        moved.transforms.previous_world_from_local.translation = Vec3::Y;
+        instances.insert(a, moved);
+        assert!(instances.prepared_instance(&a).is_none());
+        instances.prepare_uniforms(|_| allocation, |_| facts);
+        let moved_revision = instances.prepared_instance(&a).unwrap().revision;
+        assert_ne!(moved_revision, a_revision);
+        assert_eq!(
+            instances.prepared_instance(&b).unwrap().revision,
+            b_revision
+        );
+
+        let changed_facts = CpuMeshInstanceFacts {
+            skin_index: Some(79),
+            ..facts
+        };
+        instances.prepare_uniforms(
+            |_| allocation,
+            |entity| {
+                if entity == a {
+                    changed_facts
+                } else {
+                    facts
+                }
+            },
+        );
+        let changed_revision = instances.prepared_instance(&a).unwrap().revision;
+        assert_ne!(changed_revision, moved_revision);
+        assert_eq!(
+            instances
+                .prepared_instance(&a)
+                .unwrap()
+                .uniform
+                .current_skin_index,
+            79
+        );
+        assert_eq!(
+            instances.prepared_instance(&b).unwrap().revision,
+            b_revision
+        );
+
+        instances.remove(a);
+        assert_eq!(
+            instances.prepared_instance(&b).unwrap().revision,
+            b_revision
+        );
+        instances.insert(a, make_instance(false));
+        assert!(instances.prepared_instance(&a).is_none());
+        instances.prepare_uniforms(|_| allocation, |_| facts);
+        assert_ne!(
+            instances.prepared_instance(&a).unwrap().revision,
+            changed_revision
+        );
+        assert_eq!(
+            instances.prepared_instance(&b).unwrap().revision,
+            b_revision
+        );
+
         let capacity = instances.prepared.capacity();
         instances.clear();
         instances.insert(a, make_instance(false));
