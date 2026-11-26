@@ -1003,6 +1003,67 @@ pub(crate) fn remove_point_and_spot_light_view_entities(
 #[derive(Component, Default, Deref, DerefMut)]
 pub struct PointAndSpotLightViewEntities(Vec<Entity>);
 
+/// The native shadow arrays are owned for as long as their exact descriptors
+/// remain current; they must not be leased from the transient per-frame pool.
+#[doc(hidden)]
+#[derive(Resource, Default)]
+pub struct ShadowTextureAllocations {
+    point: Option<ShadowTextureArray>,
+    directional: Option<ShadowTextureArray>,
+}
+
+struct ShadowTextureArray {
+    descriptor: TextureDescriptor<'static>,
+    texture: Texture,
+    sampling_view: TextureView,
+}
+
+fn retain_shadow_array<'a>(
+    slot: &'a mut Option<ShadowTextureArray>,
+    render_device: &RenderDevice,
+    descriptor: TextureDescriptor<'static>,
+    sampling_descriptor: TextureViewDescriptor<'_>,
+) -> &'a ShadowTextureArray {
+    if slot
+        .as_ref()
+        .is_none_or(|array| array.descriptor != descriptor)
+    {
+        let texture = render_device.create_texture(&descriptor);
+        let sampling_view = texture.create_view(&sampling_descriptor);
+        *slot = Some(ShadowTextureArray {
+            descriptor,
+            texture,
+            sampling_view,
+        });
+    }
+    slot.as_ref().unwrap()
+}
+
+/// A local shadow view must still address the exact texture and array layer
+/// sampled by the current light index, even if none of the light's fields changed.
+#[doc(hidden)]
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub struct LocalShadowAllocation {
+    texture: TextureId,
+    layer: u32,
+}
+
+impl LocalShadowAllocation {
+    fn point(texture: TextureId, light_index: usize, face: usize) -> Self {
+        Self {
+            texture,
+            layer: (light_index * 6 + face) as u32,
+        }
+    }
+
+    fn spot(texture: TextureId, cascades: usize, light_index: usize) -> Self {
+        Self {
+            texture,
+            layer: (cascades + light_index) as u32,
+        }
+    }
+}
+
 #[derive(Component)]
 pub struct ShadowView {
     pub depth_attachment: DepthStencilViewAttachment,
@@ -1059,7 +1120,7 @@ pub enum LightEntity {
 
 pub fn prepare_lights(
     mut commands: Commands,
-    mut texture_cache: ResMut<TextureCache>,
+    mut texture_allocations: ResMut<ShadowTextureAllocations>,
     (render_device, render_queue): (Res<RenderDevice>, Res<RenderQueue>),
     mut global_clusterable_object_meta: ResMut<GlobalClusterableObjectMeta>,
     mut light_meta: ResMut<LightMeta>,
@@ -1132,7 +1193,7 @@ pub fn prepare_lights(
         Option<Res<RenderClusteredDecals>>,
     ),
     (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
-        Query<&ShadowView>,
+        Query<(&ShadowView, Option<&LocalShadowAllocation>)>,
         ResMut<LightKeyCache>,
         ResMut<SpecializedShadowMaterialPipelineCache>,
     ),
@@ -1493,7 +1554,9 @@ pub fn prepare_lights(
     let mut directional_light_depth_attachments =
         HashMap::<u32, DepthStencilViewAttachment>::default();
 
-    let point_light_depth_texture = texture_cache.get(
+    let allocations = &mut *texture_allocations;
+    let point_light_depth_texture = retain_shadow_array(
+        &mut allocations.point,
         &render_device,
         TextureDescriptor {
             size: Extent3d {
@@ -1509,39 +1572,37 @@ pub fn prepare_lights(
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         },
+        TextureViewDescriptor {
+            label: Some("point_light_shadow_map_array_texture_view"),
+            format: None,
+            // NOTE: iOS Simulator is missing CubeArray support so we use Cube instead.
+            // See https://github.com/bevyengine/bevy/pull/12052 - remove if support is added.
+            #[cfg(all(
+                not(target_abi = "sim"),
+                any(
+                    not(feature = "webgl"),
+                    not(target_arch = "wasm32"),
+                    feature = "webgpu"
+                )
+            ))]
+            dimension: Some(TextureViewDimension::CubeArray),
+            #[cfg(any(
+                target_abi = "sim",
+                all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu"))
+            ))]
+            dimension: Some(TextureViewDimension::Cube),
+            usage: None,
+            aspect: TextureAspect::DepthOnly,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: None,
+        },
     );
+    let point_light_depth_texture_view = &point_light_depth_texture.sampling_view;
 
-    let point_light_depth_texture_view =
-        point_light_depth_texture
-            .texture
-            .create_view(&TextureViewDescriptor {
-                label: Some("point_light_shadow_map_array_texture_view"),
-                format: None,
-                // NOTE: iOS Simulator is missing CubeArray support so we use Cube instead.
-                // See https://github.com/bevyengine/bevy/pull/12052 - remove if support is added.
-                #[cfg(all(
-                    not(target_abi = "sim"),
-                    any(
-                        not(feature = "webgl"),
-                        not(target_arch = "wasm32"),
-                        feature = "webgpu"
-                    )
-                ))]
-                dimension: Some(TextureViewDimension::CubeArray),
-                #[cfg(any(
-                    target_abi = "sim",
-                    all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu"))
-                ))]
-                dimension: Some(TextureViewDimension::Cube),
-                usage: None,
-                aspect: TextureAspect::DepthOnly,
-                base_mip_level: 0,
-                mip_level_count: None,
-                base_array_layer: 0,
-                array_layer_count: None,
-            });
-
-    let directional_light_depth_texture = texture_cache.get(
+    let directional_light_depth_texture = retain_shadow_array(
+        &mut allocations.directional,
         &render_device,
         TextureDescriptor {
             size: Extent3d {
@@ -1561,29 +1622,26 @@ pub fn prepare_lights(
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         },
+        TextureViewDescriptor {
+            label: Some("directional_light_shadow_map_array_texture_view"),
+            format: None,
+            #[cfg(any(
+                not(feature = "webgl"),
+                not(target_arch = "wasm32"),
+                feature = "webgpu"
+            ))]
+            dimension: Some(TextureViewDimension::D2Array),
+            #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+            dimension: Some(TextureViewDimension::D2),
+            usage: None,
+            aspect: TextureAspect::DepthOnly,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: None,
+        },
     );
-
-    let directional_light_depth_texture_view =
-        directional_light_depth_texture
-            .texture
-            .create_view(&TextureViewDescriptor {
-                label: Some("directional_light_shadow_map_array_texture_view"),
-                format: None,
-                #[cfg(any(
-                    not(feature = "webgl"),
-                    not(target_arch = "wasm32"),
-                    feature = "webgpu"
-                ))]
-                dimension: Some(TextureViewDimension::D2Array),
-                #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
-                dimension: Some(TextureViewDimension::D2),
-                usage: None,
-                aspect: TextureAspect::DepthOnly,
-                base_mip_level: 0,
-                mip_level_count: None,
-                base_array_layer: 0,
-                array_layer_count: None,
-            });
+    let directional_light_depth_texture_view = &directional_light_depth_texture.sampling_view;
 
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
@@ -1610,7 +1668,12 @@ pub fn prepare_lights(
             continue;
         }
 
-        if point_and_spot_light_view_entities.0.is_empty() {
+        let light_index = global_clusterable_object_meta.entity_to_index[light_entity];
+        if point_and_spot_light_view_entities.0.len() != 6 {
+            despawn_entities(
+                &mut commands,
+                mem::take(&mut point_and_spot_light_view_entities.0),
+            );
             // For each face of a cube we spawn a light entity
             let light_view_entities: Vec<_> = (0..6).map(|_| commands.spawn_empty().id()).collect();
 
@@ -1623,15 +1686,32 @@ pub fn prepare_lights(
                     point_light_frusta,
                     &light_view_entities,
                 ),
-                &point_light_depth_texture,
+                point_light_depth_texture,
                 (light_entity, light_main_entity, light, light_render_layers),
                 point_light_shadow_map.size as u32,
                 gpu_preprocessing_support.max_supported_mode,
             );
 
             point_and_spot_light_view_entities.0 = light_view_entities;
-        } else if changed_point_lights.get(*light_entity).is_ok() {
-            // Update the point shadow maps with the changes.
+        } else if changed_point_lights.get(*light_entity).is_ok()
+            || point_and_spot_light_view_entities
+                .0
+                .iter()
+                .enumerate()
+                .any(|(face, view)| {
+                    let expected = LocalShadowAllocation::point(
+                        point_light_depth_texture.texture.id(),
+                        light_index,
+                        face,
+                    );
+                    existing_shadow_views
+                        .get(*view)
+                        .ok()
+                        .and_then(|(_, lease)| lease)
+                        != Some(&expected)
+                })
+        {
+            // Update the point shadow maps when their inputs or allocation change.
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
@@ -1641,7 +1721,7 @@ pub fn prepare_lights(
                     point_light_frusta,
                     &point_and_spot_light_view_entities.0,
                 ),
-                &point_light_depth_texture,
+                point_light_depth_texture,
                 (light_entity, light_main_entity, light, light_render_layers),
                 point_light_shadow_map.size as u32,
                 gpu_preprocessing_support.max_supported_mode,
@@ -1689,14 +1769,18 @@ pub fn prepare_lights(
         // so the retained view entity must not include the camera.
         let retained_view_entity = RetainedViewEntity::new(*light_main_entity, None, 0);
 
-        if point_and_spot_light_view_entities.0.is_empty() {
+        if point_and_spot_light_view_entities.0.len() != 1 {
+            despawn_entities(
+                &mut commands,
+                mem::take(&mut point_and_spot_light_view_entities.0),
+            );
             let view_light_entity = commands.spawn_empty().id();
 
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
                 (num_directional_cascades_enabled, light_index),
-                &directional_light_depth_texture,
+                directional_light_depth_texture,
                 view_light_entity,
                 (light_entity, light_main_entity, light, light_render_layers),
                 spot_light_frustum,
@@ -1705,12 +1789,22 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = vec![view_light_entity];
-        } else if changed_point_lights.get(*light_entity).is_ok() {
+        } else if changed_point_lights.get(*light_entity).is_ok()
+            || existing_shadow_views
+                .get(point_and_spot_light_view_entities.0[0])
+                .ok()
+                .and_then(|(_, lease)| lease)
+                != Some(&LocalShadowAllocation::spot(
+                    directional_light_depth_texture.texture.id(),
+                    num_directional_cascades_enabled,
+                    light_index,
+                ))
+        {
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
                 (num_directional_cascades_enabled, light_index),
-                &directional_light_depth_texture,
+                directional_light_depth_texture,
                 // There should only be one view light entity for spotlights
                 point_and_spot_light_view_entities.0[0],
                 (light_entity, light_main_entity, light, light_render_layers),
@@ -2123,7 +2217,7 @@ pub fn prepare_lights(
 
     // Mark the existing shadow maps as unused this frame so that the first
     // drawcall to them will clear them.
-    for existing_shadow_view in &existing_shadow_views {
+    for (existing_shadow_view, _) in &existing_shadow_views {
         existing_shadow_view
             .depth_attachment
             .prepare_for_new_frame();
@@ -2156,7 +2250,7 @@ fn create_point_shadow_maps(
         Option<&CubemapFrusta>,
         &Vec<Entity>,
     ),
-    point_light_depth_texture: &CachedTexture,
+    point_light_depth_texture: &ShadowTextureArray,
     (light_entity, light_main_entity, light, light_render_layers): (
         &Entity,
         &MainEntity,
@@ -2187,7 +2281,12 @@ fn create_point_shadow_maps(
         .zip(light_view_entities.iter().copied())
         .enumerate()
     {
-        let base_array_layer = (light_index * 6 + face_index) as u32;
+        let lease = LocalShadowAllocation::point(
+            point_light_depth_texture.texture.id(),
+            light_index,
+            face_index,
+        );
+        let base_array_layer = lease.layer;
 
         let depth_attachment = point_light_depth_attachments
             .entry(base_array_layer)
@@ -2223,6 +2322,7 @@ fn create_point_shadow_maps(
             RetainedViewEntity::new(*light_main_entity, None, face_index as u32);
 
         commands.entity(view_light_entity).insert((
+            lease,
             ShadowView {
                 depth_attachment,
                 pass_name: format!(
@@ -2270,7 +2370,7 @@ fn create_spot_shadow_map(
     commands: &mut Commands,
     directional_light_depth_attachments: &mut HashMap<u32, DepthStencilViewAttachment>,
     (num_directional_cascades_enabled, light_index): (usize, usize),
-    directional_light_depth_texture: &CachedTexture,
+    directional_light_depth_texture: &ShadowTextureArray,
     view_light_entity: Entity,
     (light_entity, light_main_entity, light, light_render_layers): (
         &Entity,
@@ -2289,7 +2389,12 @@ fn create_spot_shadow_map(
                 [point_light_count..point_light_count + spot_light_shadow_maps_count] are spot lights").1;
     let spot_projection = spot_light_clip_from_view(angle, light.shadow_map_near_z);
 
-    let base_array_layer = (num_directional_cascades_enabled + light_index) as u32;
+    let lease = LocalShadowAllocation::spot(
+        directional_light_depth_texture.texture.id(),
+        num_directional_cascades_enabled,
+        light_index,
+    );
+    let base_array_layer = lease.layer;
 
     let depth_attachment = directional_light_depth_attachments
         .entry(base_array_layer)
@@ -2321,6 +2426,7 @@ fn create_spot_shadow_map(
 
     let retained_view_entity = RetainedViewEntity::new(*light_main_entity, None, 0);
     commands.entity(view_light_entity).insert((
+        lease,
         ShadowView {
             depth_attachment,
             pass_name: format!("shadow_spot_light_{light_index}"),
@@ -3181,6 +3287,23 @@ pub fn extract_shadow_lod_origin(
 
 #[cfg(test)]
 mod zero_output_tests {
+    #[test]
+    fn local_shadow_allocation_tracks_texture_replacement_and_layer_remapping() {
+        let texture = TextureId::new();
+        let replacement = TextureId::new();
+        let point = LocalShadowAllocation::point(texture, 2, 3);
+        assert_eq!(point.layer, 15);
+        assert!(point == LocalShadowAllocation::point(texture, 2, 3));
+        assert!(point != LocalShadowAllocation::point(texture, 1, 3));
+        assert!(point != LocalShadowAllocation::point(replacement, 2, 3));
+        let spot = LocalShadowAllocation::spot(texture, 4, 2);
+        assert_eq!(spot.layer, 6);
+        assert!(spot == LocalShadowAllocation::spot(texture, 4, 2));
+        assert!(spot != LocalShadowAllocation::spot(texture, 3, 2));
+        assert!(spot != LocalShadowAllocation::spot(texture, 4, 1));
+        assert!(spot != LocalShadowAllocation::spot(replacement, 4, 2));
+    }
+
     use super::*;
     use bevy_render::MainWorld;
 

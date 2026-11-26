@@ -402,6 +402,7 @@ impl Plugin for PbrPlugin {
                 ),
             )
             .init_gpu_resource::<LightMeta>()
+            .init_gpu_resource::<ShadowTextureAllocations>()
             .init_resource::<RenderShadowLodOrigin>();
 
         render_app
