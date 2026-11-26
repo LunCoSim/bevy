@@ -14,7 +14,7 @@ use crate::{
         BinnedPhaseItem, CachedRenderPipelinePhaseItem, PhaseItemExtraIndex, SortedPhaseItem,
         SortedRenderPhase, ViewBinnedRenderPhases,
     },
-    render_resource::GpuArrayBufferable,
+    render_resource::{GpuArrayBufferable, GpuArrayElement},
     sync_world::MainEntity,
 };
 
@@ -101,6 +101,7 @@ pub trait GetBatchData {
     /// batched, also return the data used for comparison when deciding whether
     /// draws can be batched, else return None for the `CompareData`.
     ///
+    /// Existing frame data may be borrowed directly through the buffer writer.
     /// This is only called when building instance data on CPU. In the GPU
     /// instance data building path, we use
     /// [`GetFullBatchData::get_index_and_compare_data`] instead.
@@ -108,7 +109,7 @@ pub trait GetBatchData {
         param: &SystemParamItem<Self::Param>,
         query_item: (Entity, MainEntity),
     ) -> Option<(
-        Self::BufferData,
+        impl GpuArrayElement<Self::BufferData>,
         Option<(Self::BatchSetCompareData, Self::BatchCompareData)>,
     )>;
 }
@@ -131,7 +132,7 @@ pub trait GetFullBatchData: GetBatchData {
     fn get_binned_batch_data(
         param: &SystemParamItem<Self::Param>,
         query_item: MainEntity,
-    ) -> Option<Self::BufferData>;
+    ) -> Option<impl GpuArrayElement<Self::BufferData>>;
 
     /// Returns the index of the [`GetFullBatchData::BufferInputData`] that the
     /// GPU preprocessing phase will use.

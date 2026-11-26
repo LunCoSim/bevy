@@ -33,10 +33,11 @@ use bevy::{
         },
         render_resource::{
             BlendState, CachedRenderPipelineId, ColorTargetState, ColorWrites, CompareFunction,
-            DepthBiasState, DepthStencilState, Face, FragmentState, MultisampleState,
-            PipelineCache, PrimitiveState, PrimitiveTopology, RenderPassDescriptor,
-            RenderPipelineDescriptor, SpecializedRenderPipeline, SpecializedRenderPipelines,
-            StencilFaceState, StencilState, StoreOp, VertexFormat, VertexState, VertexStepMode,
+            DepthBiasState, DepthStencilState, Face, FragmentState, GpuArrayElement,
+            MultisampleState, PipelineCache, PrimitiveState, PrimitiveTopology,
+            RenderPassDescriptor, RenderPipelineDescriptor, SpecializedRenderPipeline,
+            SpecializedRenderPipelines, StencilFaceState, StencilState, StoreOp, VertexFormat,
+            VertexState, VertexStepMode,
         },
         renderer::{RenderContext, ViewQuery},
         sync_component::{SyncComponent, SyncComponentPlugin},
@@ -466,7 +467,7 @@ impl GetBatchData for ColoredMesh2dPipeline {
         (mesh_instances, mesh_allocator): &SystemParamItem<Self::Param>,
         (_entity, main_entity): (Entity, MainEntity),
     ) -> Option<(
-        Self::BufferData,
+        impl GpuArrayElement<Self::BufferData>,
         Option<(Self::BatchSetCompareData, Self::BatchCompareData)>,
     )> {
         let mesh_instance = mesh_instances.get(&main_entity)?;

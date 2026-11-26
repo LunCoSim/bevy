@@ -9,7 +9,7 @@ use crate::{
     renderer::{RenderDevice, RenderQueue},
 };
 use bevy_ecs::{prelude::Component, resource::Resource};
-use core::marker::PhantomData;
+use core::{borrow::Borrow, marker::PhantomData};
 use encase::{private::WriteInto, ShaderSize, ShaderType};
 use nonmax::NonMaxU32;
 use wgpu::{BindingResource, BufferUsages, Limits};
@@ -18,6 +18,29 @@ use wgpu::{BindingResource, BufferUsages, Limits};
 pub trait GpuArrayBufferable: ShaderType + ShaderSize + WriteInto + Clone {}
 
 impl<T: ShaderType + ShaderSize + WriteInto + Clone> GpuArrayBufferable for T {}
+
+/// A per-instance value that can be encoded by reference, or moved into the
+/// temporary array when storage buffers are unavailable.
+/// Providers that already retain frame data return a reference; providers
+/// computing a fresh value return the value itself.
+pub trait GpuArrayElement<T: GpuArrayBufferable>: Borrow<T> {
+    /// Obtain owned data for the dynamic-uniform array path.
+    fn into_owned(self) -> T;
+}
+
+impl<T: GpuArrayBufferable> GpuArrayElement<T> for T {
+    #[inline]
+    fn into_owned(self) -> T {
+        self
+    }
+}
+
+impl<T: GpuArrayBufferable> GpuArrayElement<T> for &T {
+    #[inline]
+    fn into_owned(self) -> T {
+        self.clone()
+    }
+}
 
 /// Stores an array of elements to be transferred to the GPU and made accessible to shaders as a read-only array.
 ///
@@ -56,11 +79,11 @@ impl<T: GpuArrayBufferable> GpuArrayBuffer<T> {
         }
     }
 
-    pub fn push(&mut self, value: T) -> GpuArrayBufferIndex<T> {
+    pub fn push(&mut self, value: impl GpuArrayElement<T>) -> GpuArrayBufferIndex<T> {
         match self {
-            GpuArrayBuffer::Uniform(buffer) => buffer.push(value),
+            GpuArrayBuffer::Uniform(buffer) => buffer.push(value.into_owned()),
             GpuArrayBuffer::Storage(buffer) => {
-                let index = buffer.push(value) as u32;
+                let index = buffer.push_ref(value.borrow()) as u32;
                 GpuArrayBufferIndex {
                     index,
                     dynamic_offset: None,

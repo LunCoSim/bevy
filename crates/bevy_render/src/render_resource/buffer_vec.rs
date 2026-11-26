@@ -551,7 +551,13 @@ where
     }
 
     /// Adds a new value and returns its index.
+    #[inline]
     pub fn push(&mut self, value: T) -> usize {
+        self.push_ref(&value)
+    }
+
+    /// Encodes an existing value directly into the retained shader-layout bytes.
+    pub fn push_ref(&mut self, value: &T) -> usize {
         let element_size = u64::from(T::min_size()) as usize;
         let offset = self.data.len();
 
@@ -563,7 +569,7 @@ where
         // important: it hoists the bounds check up here so that the compiler
         // can eliminate all the bounds checks that `write_into` will emit.
         let mut dest = &mut self.data[offset..(offset + element_size)];
-        value.write_into(&mut Writer::new(&value, &mut dest, 0).unwrap());
+        value.write_into(&mut Writer::new(value, &mut dest, 0).unwrap());
 
         offset / u64::from(T::min_size()) as usize
     }
@@ -1011,6 +1017,69 @@ mod tests {
     struct PaddedShaderElement {
         scalar: f32,
         vector: bevy_math::Vec3,
+    }
+
+    #[test]
+    fn cpu_borrowed_buffer_encoding_preserves_bytes_and_clone_contract() {
+        use crate::render_resource::GpuArrayBuffer;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        static CLONES: AtomicUsize = AtomicUsize::new(0);
+        #[derive(ShaderType)]
+        struct Element {
+            scalar: f32,
+            vector: bevy_math::Vec3,
+        }
+        impl Clone for Element {
+            fn clone(&self) -> Self {
+                CLONES.fetch_add(1, Ordering::Relaxed);
+                Self {
+                    scalar: self.scalar,
+                    vector: self.vector,
+                }
+            }
+        }
+        let make = || Element {
+            scalar: 3.0,
+            vector: bevy_math::Vec3::new(1.0, 2.0, 4.0),
+        };
+        let value = make();
+        let mut buffer = GpuArrayBuffer::<Element>::Storage(BufferVec::new(BufferUsages::STORAGE));
+        let a = buffer.push(&value);
+        let b = buffer.push(make());
+        assert_eq!(a.index, 0);
+        assert_eq!(b.index, 1);
+        assert!(a.dynamic_offset.is_none() && b.dynamic_offset.is_none());
+        assert_eq!(CLONES.load(Ordering::Relaxed), 0);
+        let GpuArrayBuffer::Storage(storage) = &buffer else {
+            unreachable!()
+        };
+        let stride = Element::min_size().get() as usize;
+        assert_eq!(&storage.data[..stride], &storage.data[stride..]);
+        assert_eq!(storage.data.len(), stride * 2);
+        let capacity = storage.data.capacity();
+        buffer.clear();
+        assert_eq!(buffer.push(&value).index, 0);
+        let GpuArrayBuffer::Storage(storage) = &buffer else {
+            unreachable!()
+        };
+        assert_eq!(storage.data.capacity(), capacity);
+
+        // On devices without storage buffers, the dynamic-uniform array owns
+        // its entries, so borrowed elements are cloned only at that boundary.
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffers_per_shader_stage = 0;
+        limits.max_uniform_buffer_binding_size = (stride * 2) as u64;
+        let mut buffer = GpuArrayBuffer::<Element>::new(&limits);
+        let first = buffer.push(&value);
+        let second = buffer.push(make());
+        let third = buffer.push(&value);
+        assert_eq!(first.index, 0);
+        assert_eq!(second.index, 1);
+        assert_eq!(third.index, 0);
+        assert_eq!(first.dynamic_offset, second.dynamic_offset);
+        assert_ne!(first.dynamic_offset, third.dynamic_offset);
+        assert_eq!(CLONES.load(Ordering::Relaxed), 2);
     }
 
     #[test]

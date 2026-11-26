@@ -12,6 +12,7 @@ use bevy_ecs::{
 };
 use bevy_log::warn;
 use bevy_mesh::Indices;
+use bevy_platform::collections::HashMap;
 use bevy_shape::{Aabb2d, BoundingVolume};
 use glam::Vec4;
 use wgpu::{BufferUsages, DownlevelFlags, COPY_BUFFER_ALIGNMENT};
@@ -48,6 +49,9 @@ pub struct MeshAllocator {
     /// Holds all buffers and offset allocators.
     #[deref]
     slab_allocator: SlabAllocator<MeshSlabItem>,
+
+    /// Derived uniform facts published and retired with the mesh allocation.
+    uniform_allocations: HashMap<AssetId<Mesh>, MeshUniformAllocation>,
 
     /// Whether we can pack multiple vertex arrays into a single slab on this
     /// platform.
@@ -110,6 +114,17 @@ impl SlabItem for MeshSlabItem {
     fn label() -> Cow<'static, str> {
         "mesh".into()
     }
+}
+
+/// Shader instance offsets and slab identity for a currently allocated mesh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshUniformAllocation {
+    /// Offset of the first vertex in its slab.
+    pub first_vertex_index: u32,
+    /// Offset of the mesh metadata, if it is allocated.
+    pub metadata_index: Option<u32>,
+    /// Slabs used by sorted batching, absent for an unallocated mesh.
+    pub mesh_slabs: Option<MeshSlabs>,
 }
 
 /// IDs of the slabs associated with a single mesh.
@@ -239,6 +254,7 @@ impl FromWorld for MeshAllocator {
 
         Self {
             slab_allocator,
+            uniform_allocations: HashMap::default(),
             general_vertex_slabs_supported,
         }
     }
@@ -271,6 +287,29 @@ pub fn allocate_and_free_meshes(
 }
 
 impl MeshAllocator {
+    /// Resolved uniform offsets and slab identity for the current allocation.
+    pub fn mesh_uniform_allocation(
+        &self,
+        mesh_id: &AssetId<Mesh>,
+    ) -> Option<MeshUniformAllocation> {
+        self.uniform_allocations.get(mesh_id).copied()
+    }
+
+    fn publish_uniform_allocation(&mut self, mesh_id: AssetId<Mesh>) {
+        let facts = MeshUniformAllocation {
+            first_vertex_index: self
+                .mesh_vertex_slice(&mesh_id)
+                .map_or(0, |slice| slice.range.start),
+            metadata_index: self
+                .mesh_metadata_slice(&mesh_id)
+                .map(|slice| slice.range.start),
+            mesh_slabs: self.mesh_slabs(&mesh_id),
+        };
+        if facts.mesh_slabs.is_some() {
+            self.uniform_allocations.insert(mesh_id, facts);
+        }
+    }
+
     /// Returns the buffer and range within that buffer of the metadata for
     /// the mesh with the given ID.
     ///
@@ -508,6 +547,7 @@ impl MeshAllocator {
             self.copy_mesh_index_data(mesh_id, mesh, render_device, render_queue);
             #[cfg(feature = "morph")]
             self.copy_mesh_morph_target_data(mesh_id, mesh, render_device, render_queue);
+            self.publish_uniform_allocation(*mesh_id);
         }
     }
 
@@ -644,6 +684,7 @@ impl MeshAllocator {
             .chain(extracted_meshes.added.iter());
 
         for mesh_id in meshes_to_free {
+            self.uniform_allocations.remove(mesh_id);
             deallocation_stage.free(&MeshAllocationKey::new(*mesh_id, ElementClass::Metadata));
             deallocation_stage.free(&MeshAllocationKey::new(*mesh_id, ElementClass::Vertex));
             deallocation_stage.free(&MeshAllocationKey::new(*mesh_id, ElementClass::Index));
@@ -791,6 +832,7 @@ mod tests {
     fn mesh_allocator(general_vertex_slabs_supported: bool) -> MeshAllocator {
         MeshAllocator {
             slab_allocator: SlabAllocator::new(),
+            uniform_allocations: HashMap::default(),
             general_vertex_slabs_supported,
         }
     }
@@ -963,6 +1005,56 @@ mod tests {
             "at least one element class was left allocated, so it would leak"
         );
         assert_eq!(mesh_allocator.slab_count(), 0);
+    }
+
+    #[test]
+    fn cpu_uniform_allocation_facts_follow_mesh_lifetime() {
+        let (render_device, render_queue) = create_dummy_device();
+        let settings = MeshAllocatorSettings::default();
+        let mut layouts = MeshVertexBufferLayouts::default();
+        let mut allocator = mesh_allocator(true);
+        let id = mesh_id(1);
+        let assert_matches = |allocator: &MeshAllocator| {
+            let facts = allocator.mesh_uniform_allocation(&id).unwrap();
+            assert_eq!(
+                facts.first_vertex_index,
+                allocator.mesh_vertex_slice(&id).unwrap().range.start
+            );
+            assert_eq!(
+                facts.metadata_index,
+                allocator
+                    .mesh_metadata_slice(&id)
+                    .map(|slice| slice.range.start)
+            );
+            assert_eq!(facts.mesh_slabs, allocator.mesh_slabs(&id));
+            facts
+        };
+        assert!(allocator.mesh_uniform_allocation(&id).is_none());
+        let initial = extracted_mesh(id, full_mesh());
+        allocator.allocate_meshes(
+            &settings,
+            &initial,
+            &mut layouts,
+            &render_device,
+            &render_queue,
+        );
+        let before = assert_matches(&allocator);
+        assert!(before.metadata_index.is_some());
+        let changed = extracted_mesh(id, wider_vertex_mesh());
+        allocator.free_meshes(&changed);
+        assert!(allocator.mesh_uniform_allocation(&id).is_none());
+        allocator.allocate_meshes(
+            &settings,
+            &changed,
+            &mut layouts,
+            &render_device,
+            &render_queue,
+        );
+        let after = assert_matches(&allocator);
+        assert!(after.metadata_index.is_none());
+        assert_ne!(before.mesh_slabs, after.mesh_slabs);
+        allocator.free_meshes(&changed);
+        assert!(allocator.mesh_uniform_allocation(&id).is_none());
     }
 
     /// A mesh that loses part of its data on re-extraction must give up the

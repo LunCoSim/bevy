@@ -50,9 +50,9 @@ use bevy::{
         },
         render_resource::{
             CachedRenderPipelineId, ColorTargetState, ColorWrites, Face, FragmentState,
-            PipelineCache, PrimitiveState, RenderPassDescriptor, RenderPipelineDescriptor,
-            SpecializedMeshPipeline, SpecializedMeshPipelineError, SpecializedMeshPipelines,
-            VertexState,
+            GpuArrayElement, PipelineCache, PrimitiveState, RenderPassDescriptor,
+            RenderPipelineDescriptor, SpecializedMeshPipeline, SpecializedMeshPipelineError,
+            SpecializedMeshPipelines, VertexState,
         },
         renderer::{RenderContext, ViewQuery},
         sync_world::{MainEntity, MainEntityHashSet},
@@ -388,7 +388,7 @@ impl GetBatchData for StencilPipeline {
         (mesh_instances, mesh_allocator): &SystemParamItem<Self::Param>,
         (_entity, main_entity): (Entity, MainEntity),
     ) -> Option<(
-        Self::BufferData,
+        impl GpuArrayElement<Self::BufferData>,
         Option<(Self::BatchSetCompareData, Self::BatchCompareData)>,
     )> {
         let RenderMeshInstances::CpuBuilding(ref mesh_instances) = **mesh_instances else {
@@ -452,7 +452,7 @@ impl GetFullBatchData for StencilPipeline {
     fn get_binned_batch_data(
         (mesh_instances, mesh_allocator): &SystemParamItem<Self::Param>,
         main_entity: MainEntity,
-    ) -> Option<Self::BufferData> {
+    ) -> Option<impl GpuArrayElement<Self::BufferData>> {
         let RenderMeshInstances::CpuBuilding(ref mesh_instances) = **mesh_instances else {
             error!(
                 "`get_binned_batch_data` should never be called in GPU mesh uniform building mode"

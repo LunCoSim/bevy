@@ -507,7 +507,7 @@ impl GetBatchData for Mesh2dPipeline {
         (mesh_instances, mesh_allocator): &SystemParamItem<Self::Param>,
         (_entity, main_entity): (Entity, MainEntity),
     ) -> Option<(
-        Self::BufferData,
+        impl GpuArrayElement<Self::BufferData>,
         Option<(Self::BatchSetCompareData, Self::BatchCompareData)>,
     )> {
         let mesh_instance = mesh_instances.get(&main_entity)?;
@@ -536,7 +536,7 @@ impl GetFullBatchData for Mesh2dPipeline {
     fn get_binned_batch_data(
         (mesh_instances, mesh_allocator): &SystemParamItem<Self::Param>,
         main_entity: MainEntity,
-    ) -> Option<Self::BufferData> {
+    ) -> Option<impl GpuArrayElement<Self::BufferData>> {
         let mesh_instance = mesh_instances.get(&main_entity)?;
         let metadata_index = mesh_allocator
             .mesh_metadata_slice(&mesh_instance.mesh_asset_id)

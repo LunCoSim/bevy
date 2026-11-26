@@ -44,7 +44,7 @@ use bevy_render::impl_atomic_pod;
 use bevy_render::material_bind_groups::{
     MaterialBindGroupIndex, MaterialBindGroupSlot, MaterialBindingId, RenderMaterialBindings,
 };
-use bevy_render::mesh::allocator::{MeshSlabId, MeshSlabs};
+use bevy_render::mesh::allocator::{MeshSlabId, MeshSlabs, MeshUniformAllocation};
 use bevy_render::mesh::morph::{
     MorphTargetImage, MorphTargetsResource, RenderMorphTargetAllocator,
 };
@@ -304,8 +304,13 @@ impl Plugin for MeshRenderPlugin {
                     )
                     .add_systems(
                         Render,
-                        no_gpu_preprocessing::write_batched_instance_buffer::<MeshPipeline>
-                            .in_set(RenderSystems::PrepareResourcesFlush),
+                        (
+                            prepare_cpu_mesh_uniforms
+                                .in_set(RenderSystems::PrepareResources)
+                                .after(prepare_skins),
+                            no_gpu_preprocessing::write_batched_instance_buffer::<MeshPipeline>
+                                .in_set(RenderSystems::PrepareResourcesFlush),
+                        ),
                     );
             };
 
@@ -1219,8 +1224,12 @@ pub enum RenderMeshInstances {
 
 /// Information that the render world keeps about each entity that contains a
 /// mesh, when using CPU mesh instance data building.
-#[derive(Default, Deref, DerefMut)]
-pub struct RenderMeshInstancesCpu(MainEntityHashMap<RenderMeshInstanceCpu>);
+#[derive(Default)]
+pub struct RenderMeshInstancesCpu {
+    indices: MainEntityHashMap<usize>,
+    instances: Vec<(MainEntity, RenderMeshInstanceCpu)>,
+    prepared: Vec<PreparedCpuMeshInstance>,
+}
 
 /// Information that the render world keeps about each entity that contains a
 /// mesh, when using GPU mesh instance data building.
@@ -1273,6 +1282,46 @@ impl RenderMeshInstances {
 }
 
 impl RenderMeshInstancesCpu {
+    /// Look up a visible instance using its main-world identity.
+    pub fn get(&self, entity: &MainEntity) -> Option<&RenderMeshInstanceCpu> {
+        Some(&self.instances[*self.indices.get(entity)?].1)
+    }
+
+    /// Iterate the visible native instances in dense storage.
+    pub fn iter(&self) -> impl Iterator<Item = (&MainEntity, &RenderMeshInstanceCpu)> {
+        self.instances
+            .iter()
+            .map(|(entity, instance)| (entity, instance))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &MainEntity> {
+        self.indices.keys()
+    }
+
+    fn get_mut(&mut self, entity: &MainEntity) -> Option<&mut RenderMeshInstanceCpu> {
+        Some(&mut self.instances[*self.indices.get(entity)?].1)
+    }
+
+    fn clear(&mut self) {
+        self.indices.clear();
+        self.instances.clear();
+        self.prepared.clear();
+    }
+
+    fn insert(&mut self, entity: MainEntity, instance: RenderMeshInstanceCpu) {
+        match self.indices.entry(entity) {
+            Entry::Occupied(entry) => self.instances[*entry.get()].1 = instance,
+            Entry::Vacant(entry) => {
+                entry.insert(self.instances.len());
+                self.instances.push((entity, instance));
+            }
+        }
+    }
+
+    fn prepared_instance(&self, entity: &MainEntity) -> Option<&PreparedCpuMeshInstance> {
+        self.prepared.get(*self.indices.get(entity)?)
+    }
+
     fn mesh_asset_id(&self, entity: MainEntity) -> Option<AssetId<Mesh>> {
         self.get(&entity)
             .map(|render_mesh_instance| render_mesh_instance.mesh_asset_id())
@@ -2896,13 +2945,113 @@ pub struct MeshBatchSetCompareData {
     lightmap_slab: Option<NonMaxU32>,
 }
 
+#[derive(Clone, Copy)]
+struct CpuMeshInstanceFacts {
+    lightmap: Option<(LightmapSlotIndex, Rect)>,
+    lightmap_slab: Option<NonMaxU32>,
+    skin_index: Option<u32>,
+    morph_descriptor_index: Option<MorphDescriptorIndex>,
+}
+
+struct PreparedCpuMeshInstance {
+    uniform: MeshUniform,
+    sorted_compare: Option<(MeshBatchSetCompareData, AssetId<Mesh>)>,
+    has_mesh_slabs: bool,
+}
+
+impl PreparedCpuMeshInstance {
+    fn sorted_batch(
+        &self,
+    ) -> Option<(
+        &MeshUniform,
+        Option<(MeshBatchSetCompareData, AssetId<Mesh>)>,
+    )> {
+        // Sorted phases require allocated mesh slabs even for unbatchable
+        // items. Binned phases already own that admission in their bin keys.
+        self.has_mesh_slabs
+            .then_some((&self.uniform, self.sorted_compare))
+    }
+}
+
+impl RenderMeshInstancesCpu {
+    fn prepare_uniforms(
+        &mut self,
+        mut resolve_mesh: impl FnMut(&AssetId<Mesh>) -> MeshUniformAllocation,
+        mut resolve_instance: impl FnMut(MainEntity) -> CpuMeshInstanceFacts,
+    ) {
+        // Preserve the extraction owner's dense indices and write the frame's
+        // uniforms in the same order. No second entity hash table is needed.
+        self.prepared.clear();
+        self.prepared.reserve(self.instances.len());
+        for (entity, instance) in &self.instances {
+            let mesh_id = instance.mesh_asset_id();
+            let allocation = resolve_mesh(&mesh_id);
+            let facts = resolve_instance(*entity);
+            let material = instance.material_bindings_index();
+            let uniform = MeshUniform::new(
+                &instance.transforms,
+                allocation.first_vertex_index,
+                material.slot,
+                facts.lightmap,
+                facts.skin_index,
+                facts.morph_descriptor_index,
+                Some(instance.tag()),
+                allocation.metadata_index,
+            );
+            let sorted_compare = allocation.mesh_slabs.and_then(|mesh_slabs| {
+                instance.should_batch().then_some((
+                    MeshBatchSetCompareData {
+                        material_bind_group_index: material.group,
+                        mesh_slabs,
+                        lightmap_slab: facts.lightmap_slab,
+                    },
+                    mesh_id,
+                ))
+            });
+            self.prepared.push(PreparedCpuMeshInstance {
+                uniform,
+                sorted_compare,
+                has_mesh_slabs: allocation.mesh_slabs.is_some(),
+            });
+        }
+    }
+}
+
+/// Prepare after extraction, asset preparation, specialization, queueing and
+/// skin preparation, before any native CPU mesh phase builds its batches.
+fn prepare_cpu_mesh_uniforms(
+    mut mesh_instances: ResMut<RenderMeshInstances>,
+    lightmaps: Res<RenderLightmaps>,
+    mesh_allocator: Res<MeshAllocator>,
+    skin_uniforms: Res<SkinUniforms>,
+    morph_indices: Res<MorphIndices>,
+) {
+    let RenderMeshInstances::CpuBuilding(instances) = &mut *mesh_instances else {
+        return;
+    };
+    instances.prepare_uniforms(
+        |mesh_id| {
+            mesh_allocator
+                .mesh_uniform_allocation(mesh_id)
+                .unwrap_or_default()
+        },
+        |entity| {
+            let lightmap = lightmaps.render_lightmaps.get(&entity);
+            CpuMeshInstanceFacts {
+                lightmap: lightmap.map(|lightmap| (lightmap.slot_index, lightmap.uv_rect)),
+                lightmap_slab: lightmap.map(|lightmap| lightmap.slab_index.0),
+                skin_index: skin_uniforms.skin_index(entity),
+                morph_descriptor_index: morph_indices.morph_descriptor_index(entity),
+            }
+        },
+    );
+}
+
 impl GetBatchData for MeshPipeline {
     type Param = (
         SRes<RenderMeshInstances>,
         SRes<RenderLightmaps>,
         SRes<MeshAllocator>,
-        SRes<SkinUniforms>,
-        SRes<MorphIndices>,
     );
     type BatchSetCompareData = MeshBatchSetCompareData;
     type BatchCompareData = AssetId<Mesh>;
@@ -2910,58 +3059,17 @@ impl GetBatchData for MeshPipeline {
     type BufferData = MeshUniform;
 
     fn get_batch_data(
-        (mesh_instances, lightmaps, mesh_allocator, skin_uniforms, morph_indices): &SystemParamItem<
-            Self::Param,
-        >,
+        (mesh_instances, _, _): &SystemParamItem<Self::Param>,
         (_entity, main_entity): (Entity, MainEntity),
     ) -> Option<(
-        Self::BufferData,
+        impl GpuArrayElement<Self::BufferData>,
         Option<(Self::BatchSetCompareData, Self::BatchCompareData)>,
     )> {
-        let RenderMeshInstances::CpuBuilding(ref mesh_instances) = **mesh_instances else {
-            error!(
-                "`get_batch_data` should never be called in GPU mesh uniform \
-                building mode"
-            );
+        let RenderMeshInstances::CpuBuilding(instances) = &**mesh_instances else {
+            error!("`get_batch_data` should never be called in GPU mesh uniform building mode");
             return None;
         };
-        let mesh_instance = mesh_instances.get(&main_entity)?;
-        let mesh_asset_id = mesh_instance.mesh_asset_id();
-        let first_vertex_index = match mesh_allocator.mesh_vertex_slice(&mesh_asset_id) {
-            Some(mesh_vertex_slice) => mesh_vertex_slice.range.start,
-            None => 0,
-        };
-        let mesh_slabs = mesh_allocator.mesh_slabs(&mesh_asset_id)?;
-        let maybe_lightmap = lightmaps.render_lightmaps.get(&main_entity);
-
-        let current_skin_index = skin_uniforms.skin_index(main_entity);
-        let morph_descriptor_index = morph_indices.morph_descriptor_index(main_entity);
-        let material_bind_group_index = mesh_instance.material_bindings_index();
-
-        let metadata_index = mesh_allocator
-            .mesh_metadata_slice(&mesh_asset_id)
-            .map(|mesh_metadata_slice| mesh_metadata_slice.range.start);
-
-        Some((
-            MeshUniform::new(
-                &mesh_instance.transforms,
-                first_vertex_index,
-                material_bind_group_index.slot,
-                maybe_lightmap.map(|lightmap| (lightmap.slot_index, lightmap.uv_rect)),
-                current_skin_index,
-                morph_descriptor_index,
-                Some(mesh_instance.tag()),
-                metadata_index,
-            ),
-            mesh_instance.should_batch().then_some((
-                MeshBatchSetCompareData {
-                    material_bind_group_index: material_bind_group_index.group,
-                    mesh_slabs,
-                    lightmap_slab: maybe_lightmap.map(|lightmap| lightmap.slab_index.0),
-                },
-                mesh_instance.mesh_asset_id(),
-            )),
-        ))
+        instances.prepared_instance(&main_entity)?.sorted_batch()
     }
 }
 
@@ -2969,7 +3077,7 @@ impl GetFullBatchData for MeshPipeline {
     type BufferInputData = MeshInputUniform;
 
     fn get_index_and_compare_data(
-        (mesh_instances, lightmaps, mesh_allocator, _, _): &SystemParamItem<Self::Param>,
+        (mesh_instances, lightmaps, mesh_allocator): &SystemParamItem<Self::Param>,
         main_entity: MainEntity,
     ) -> Option<(
         NonMaxU32,
@@ -3003,46 +3111,20 @@ impl GetFullBatchData for MeshPipeline {
     }
 
     fn get_binned_batch_data(
-        (mesh_instances, lightmaps, mesh_allocator, skin_uniforms, morph_indices): &SystemParamItem<
-            Self::Param,
-        >,
+        (mesh_instances, _, _): &SystemParamItem<Self::Param>,
         main_entity: MainEntity,
-    ) -> Option<Self::BufferData> {
-        let RenderMeshInstances::CpuBuilding(ref mesh_instances) = **mesh_instances else {
+    ) -> Option<impl GpuArrayElement<Self::BufferData>> {
+        let RenderMeshInstances::CpuBuilding(instances) = &**mesh_instances else {
             error!(
                 "`get_binned_batch_data` should never be called in GPU mesh uniform building mode"
             );
             return None;
         };
-        let mesh_instance = mesh_instances.get(&main_entity)?;
-        let mesh_asset_id = mesh_instance.mesh_asset_id();
-        let first_vertex_index = match mesh_allocator.mesh_vertex_slice(&mesh_asset_id) {
-            Some(mesh_vertex_slice) => mesh_vertex_slice.range.start,
-            None => 0,
-        };
-        let maybe_lightmap = lightmaps.render_lightmaps.get(&main_entity);
-
-        let current_skin_index = skin_uniforms.skin_index(main_entity);
-        let morph_descriptor_index = morph_indices.morph_descriptor_index(main_entity);
-
-        let metadata_index = mesh_allocator
-            .mesh_metadata_slice(&mesh_asset_id)
-            .map(|mesh_metadata_slice| mesh_metadata_slice.range.start);
-
-        Some(MeshUniform::new(
-            &mesh_instance.transforms,
-            first_vertex_index,
-            mesh_instance.material_bindings_index().slot,
-            maybe_lightmap.map(|lightmap| (lightmap.slot_index, lightmap.uv_rect)),
-            current_skin_index,
-            morph_descriptor_index,
-            Some(mesh_instance.tag()),
-            metadata_index,
-        ))
+        Some(&instances.prepared_instance(&main_entity)?.uniform)
     }
 
     fn get_binned_index(
-        (mesh_instances, _, _, _, _): &SystemParamItem<Self::Param>,
+        (mesh_instances, _, _): &SystemParamItem<Self::Param>,
         main_entity: MainEntity,
     ) -> Option<NonMaxU32> {
         // This should only be called during GPU building.
@@ -4883,6 +4965,139 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{AtomicU64ZeroBitIter, MeshPipelineKey};
+
+    #[test]
+    fn cpu_mesh_uniforms_dense_borrow_and_refresh() {
+        use super::*;
+        use bevy_asset::Handle;
+        use bevy_math::Affine3A;
+
+        let mut world = World::new();
+        let a = MainEntity::from(world.spawn_empty().id());
+        let b = MainEntity::from(world.spawn_empty().id());
+        let mesh = Mesh3d(Handle::default());
+        let material = MaterialBindingId {
+            group: MaterialBindGroupIndex(4),
+            slot: MaterialBindGroupSlot(5),
+        };
+        let make_instance = |no_automatic_batching| {
+            let shared = RenderMeshInstanceSharedFlat::for_cpu_building(
+                None,
+                &mesh,
+                Some(&MeshTag::new(31)),
+                material,
+                false,
+                no_automatic_batching,
+            );
+            RenderMeshInstanceCpu {
+                shared: (&shared).into(),
+                transforms: MeshTransforms {
+                    world_from_local: Affine3A::from_scale(Vec3::new(2.0, 3.0, 4.0)).into(),
+                    previous_world_from_local: Affine3A::from_translation(Vec3::X).into(),
+                    flags: MeshFlags::SHADOW_RECEIVER.bits(),
+                },
+                render_layers: None,
+            }
+        };
+        let mut instances = RenderMeshInstancesCpu::default();
+        instances.insert(a, make_instance(false));
+        instances.insert(b, make_instance(true));
+        let facts = CpuMeshInstanceFacts {
+            lightmap: Some((
+                LightmapSlotIndex(NonMaxU16::new(7).unwrap()),
+                Rect::new(0.1, 0.2, 0.8, 0.9),
+            )),
+            lightmap_slab: NonMaxU32::new(11),
+            skin_index: Some(12),
+            morph_descriptor_index: Some(MorphDescriptorIndex(13)),
+        };
+        let mut resolves = 0;
+        let slabs = MeshSlabs::default();
+        let allocation = MeshUniformAllocation {
+            first_vertex_index: 19,
+            metadata_index: Some(23),
+            mesh_slabs: Some(slabs),
+        };
+        instances.prepare_uniforms(
+            |_| {
+                resolves += 1;
+                allocation
+            },
+            |_| facts,
+        );
+        assert_eq!(resolves, 2);
+        let expected = MeshUniform::new(
+            &instances.get(&a).unwrap().transforms,
+            19,
+            material.slot,
+            facts.lightmap,
+            facts.skin_index,
+            facts.morph_descriptor_index,
+            Some(31),
+            Some(23),
+        );
+        let a_prepared = instances.prepared_instance(&a).unwrap();
+        let b_prepared = instances.prepared_instance(&b).unwrap();
+        let (sorted, compare) = a_prepared.sorted_batch().unwrap();
+        assert!(core::ptr::eq(sorted, &a_prepared.uniform));
+        let (compare, mesh_id) = compare.unwrap();
+        assert_eq!(mesh_id, mesh.id());
+        assert!(compare.material_bind_group_index == material.group);
+        assert_eq!(compare.mesh_slabs, slabs);
+        assert_eq!(compare.lightmap_slab, facts.lightmap_slab);
+        for actual in [sorted, &a_prepared.uniform, &b_prepared.uniform] {
+            assert_eq!(actual.world_from_local, expected.world_from_local);
+            assert_eq!(
+                actual.previous_world_from_local,
+                expected.previous_world_from_local
+            );
+            assert_eq!(
+                actual.local_from_world_transpose_a,
+                expected.local_from_world_transpose_a
+            );
+            assert_eq!(
+                actual.local_from_world_transpose_b,
+                expected.local_from_world_transpose_b
+            );
+            assert_eq!(actual.flags, expected.flags);
+            assert_eq!(actual.lightmap_uv_rect, expected.lightmap_uv_rect);
+            assert_eq!(actual.first_vertex_index, expected.first_vertex_index);
+            assert_eq!(actual.current_skin_index, expected.current_skin_index);
+            assert_eq!(
+                actual.material_and_lightmap_bind_group_slot,
+                expected.material_and_lightmap_bind_group_slot
+            );
+            assert_eq!(actual.tag, expected.tag);
+            assert_eq!(
+                actual.morph_descriptor_index,
+                expected.morph_descriptor_index
+            );
+            assert_eq!(actual.metadata_index, expected.metadata_index);
+        }
+        assert!(b_prepared.sorted_batch().unwrap().1.is_none());
+        let capacity = instances.prepared.capacity();
+        instances.clear();
+        instances.insert(a, make_instance(false));
+        assert!(instances.prepared_instance(&a).is_none());
+        instances.prepare_uniforms(
+            |_| {
+                resolves += 1;
+                MeshUniformAllocation {
+                    first_vertex_index: 41,
+                    metadata_index: Some(43),
+                    mesh_slabs: None,
+                }
+            },
+            |_| facts,
+        );
+        assert_eq!(resolves, 3);
+        assert_eq!(instances.prepared.capacity(), capacity);
+        assert!(instances.prepared_instance(&b).is_none());
+        let prepared = instances.prepared_instance(&a).unwrap();
+        assert!(prepared.sorted_batch().is_none());
+        assert_eq!(prepared.uniform.first_vertex_index, 41);
+        assert_eq!(prepared.uniform.metadata_index, 43);
+    }
 
     #[test]
     fn mesh_key_msaa_samples() {
