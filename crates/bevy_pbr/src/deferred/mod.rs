@@ -306,6 +306,8 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
             key.intersection(MeshPipelineKey::SHADOW_FILTER_METHOD_RESERVED_BITS);
         if shadow_filter_method == MeshPipelineKey::SHADOW_FILTER_METHOD_HARDWARE_2X2 {
             shader_defs.push("SHADOW_FILTER_METHOD_HARDWARE_2X2".into());
+        } else if shadow_filter_method == MeshPipelineKey::SHADOW_FILTER_METHOD_TENT_3X3 {
+            shader_defs.push("SHADOW_FILTER_METHOD_TENT_3X3".into());
         } else if shadow_filter_method == MeshPipelineKey::SHADOW_FILTER_METHOD_GAUSSIAN {
             shader_defs.push("SHADOW_FILTER_METHOD_GAUSSIAN".into());
         } else if shadow_filter_method == MeshPipelineKey::SHADOW_FILTER_METHOD_TEMPORAL {

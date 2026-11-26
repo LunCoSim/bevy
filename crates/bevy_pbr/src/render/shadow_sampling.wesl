@@ -249,6 +249,22 @@ fn search_for_blockers_in_shadow_map(
     return sum.x / sum.y;
 }
 
+// Pair adjacent taps of the separable [1, 2, 1] kernel on each axis.
+fn sample_shadow_map_tent(uv: vec2<f32>, depth: f32, layer: i32) -> f32 {
+    let size = vec2<f32>(textureDimensions(view_bindings::directional_shadow_textures));
+    let grid = uv * size - 0.5;
+    let s = fract(grid);
+    let left = 3.0 - 2.0 * s;
+    let right = 1.0 + 2.0 * s;
+    let center = floor(grid) + 0.5;
+    let lo = (center - 1.0 + (2.0 - s) / left) / size;
+    let hi = (center + 1.0 + s / right) / size;
+    return (left.x * left.y * sample_shadow_map_hardware(lo, depth, layer)
+        + right.x * left.y * sample_shadow_map_hardware(vec2(hi.x, lo.y), depth, layer)
+        + left.x * right.y * sample_shadow_map_hardware(vec2(lo.x, hi.y), depth, layer)
+        + right.x * right.y * sample_shadow_map_hardware(hi, depth, layer)) / 16.0;
+}
+
 fn sample_shadow_map(
     light_local: vec2<f32>,
     depth: f32,
@@ -256,7 +272,9 @@ fn sample_shadow_map(
     frag_coord_xy: vec2<f32>,
     texel_size: f32,
 ) -> f32 {
-    @if(SHADOW_FILTER_METHOD_GAUSSIAN)
+    @if(SHADOW_FILTER_METHOD_TENT_3X3)
+    return sample_shadow_map_tent(light_local, depth, array_index);
+    @elif(SHADOW_FILTER_METHOD_GAUSSIAN)
     return sample_shadow_map_castano_thirteen(light_local, depth, array_index);
     @elif(SHADOW_FILTER_METHOD_TEMPORAL)
     return sample_shadow_map_jimenez_fourteen(
@@ -519,7 +537,7 @@ fn sample_shadow_cubemap(
     @elif(SHADOW_FILTER_METHOD_TEMPORAL)
     return sample_shadow_cubemap_jittered(
         light_local, depth, frag_coord_xy, POINT_SHADOW_SCALE, distance_to_light, light_id, true);
-    @elif(SHADOW_FILTER_METHOD_HARDWARE_2X2)
+    @elif(SHADOW_FILTER_METHOD_HARDWARE_2X2 || SHADOW_FILTER_METHOD_TENT_3X3)
     return sample_shadow_cubemap_hardware(light_local, depth, light_id);
     @else
     // This needs a default return value to avoid shader compilation errors if it's compiled with no SHADOW_FILTER_METHOD_* defined.

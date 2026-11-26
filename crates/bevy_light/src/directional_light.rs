@@ -161,6 +161,11 @@ impl Default for DirectionalLight {
 }
 
 impl DirectionalLight {
+    /// Normal offset actually applied by directional shadow lookups, in texels.
+    pub fn receiver_normal_bias(&self) -> f32 {
+        self.shadow_normal_bias * core::f32::consts::SQRT_2
+    }
+
     /// The default value of [`DirectionalLight::shadow_depth_bias`].
     pub const DEFAULT_SHADOW_DEPTH_BIAS: f32 = 0.02;
     /// The default value of [`DirectionalLight::shadow_normal_bias`].
