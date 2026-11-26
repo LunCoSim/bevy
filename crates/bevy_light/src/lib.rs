@@ -1075,242 +1075,426 @@ fn aabb_is_outside_directional_shadow_receiver_bounds(
     false
 }
 
+type LocalCasterQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static InheritedVisibility,
+        Option<&'static RenderLayers>,
+        Option<&'static Aabb>,
+        Option<&'static GlobalTransform>,
+        Has<VisibilityRange>,
+        Has<NoFrustumCulling>,
+    ),
+    (
+        Without<NotShadowCaster>,
+        Without<DirectionalLight>,
+        Without<NoCpuCulling>,
+        With<Mesh3d>,
+        With<ViewVisibility>,
+    ),
+>;
+
+#[derive(Default)]
+struct LocalShadowView {
+    center: Vec3A,
+    range: f32,
+    layers: RenderLayers,
+    frusta: SmallVec<[Frustum; 6]>,
+    origin: Option<Entity>,
+    union: Arc<Vec<Entity>>,
+}
+
+impl LocalShadowView {
+    fn matches(
+        &self,
+        sphere: &Sphere,
+        layers: &RenderLayers,
+        frusta: &[Frustum],
+        origin: Option<Entity>,
+    ) -> bool {
+        self.center == sphere.center
+            && self.range == sphere.radius
+            && self.layers == *layers
+            && self.origin == origin
+            && self.frusta.len() == frusta.len()
+            && self.frusta.iter().zip(frusta).all(|(a, b)| a.0 == b.0)
+    }
+}
+
+#[derive(Default)]
+struct LocalShadowScratch {
+    queues: Parallel<Vec<(Entity, u8)>>,
+    decisions: Vec<(Entity, u8)>,
+    merge: Vec<Entity>,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct LocalShadowVisibilityCache {
+    points: EntityHashMap<LocalShadowView>,
+    spots: EntityHashMap<LocalShadowView>,
+    dirty: Vec<Entity>,
+    scratch: LocalShadowScratch,
+}
+
+// A bit per shadow face. This uses the same layer, range, sphere and frustum
+// tests for both sparse reconciliation and a full native parallel traversal.
+fn local_caster_faces(
+    entity: Entity,
+    inherited: &InheritedVisibility,
+    layers: Option<&RenderLayers>,
+    aabb: Option<&Aabb>,
+    transform: Option<&GlobalTransform>,
+    has_range: bool,
+    no_frustum: bool,
+    view_mask: &RenderLayers,
+    sphere: &Sphere,
+    frusta: &[Frustum],
+    origin: Option<Entity>,
+    ranges: Option<&VisibleEntityRanges>,
+) -> u8 {
+    if !inherited.get() || !view_mask.intersects(layers.unwrap_or_default()) {
+        return 0;
+    }
+    if has_range
+        && ranges.is_some_and(|ranges| {
+            origin.is_none_or(|origin| !ranges.entity_is_in_range_of_view(entity, origin))
+        })
+    {
+        return 0;
+    }
+    if no_frustum || aabb.is_none() || transform.is_none() {
+        return (1_u8 << frusta.len()) - 1;
+    }
+    let model_to_world = transform.unwrap().affine();
+    let aabb = aabb.unwrap();
+    if !sphere.intersects_obb(aabb, &model_to_world) {
+        return 0;
+    }
+    frusta.iter().enumerate().fold(0, |mask, (index, frustum)| {
+        if frustum.intersects_obb(aabb, &model_to_world, true, true) {
+            mask | (1 << index)
+        } else {
+            mask
+        }
+    })
+}
+
+fn update_local_shadow_view<'a>(
+    view: &mut LocalShadowView,
+    stable: bool,
+    dirty: &[Entity],
+    scratch: &mut LocalShadowScratch,
+    sphere: &Sphere,
+    layers: &RenderLayers,
+    frusta: &[Frustum],
+    origin: Option<Entity>,
+    ranges: Option<&VisibleEntityRanges>,
+    casters: &LocalCasterQuery,
+    lists: impl Iterator<Item = &'a mut VisibleMeshEntities>,
+) -> bool {
+    let test = |(entity, inherited, mask, aabb, transform, range, no_frustum)| {
+        local_caster_faces(
+            entity, inherited, mask, aabb, transform, range, no_frustum, layers, sphere, frusta,
+            origin, ranges,
+        )
+    };
+    scratch.decisions.clear();
+    let mut membership_changed = false;
+    let union = Arc::make_mut(&mut view.union);
+    if stable && dirty.len() <= casters.iter().len() / 4 {
+        scratch.decisions.extend(
+            dirty
+                .iter()
+                .map(|&entity| (entity, casters.get(entity).map_or(0, test))),
+        );
+        if scratch
+            .decisions
+            .iter()
+            .any(|(entity, mask)| union.binary_search(entity).is_ok() != (*mask != 0))
+        {
+            reconcile_sorted_visibility(
+                union,
+                &scratch.decisions,
+                |mask| usize::from(*mask != 0),
+                &mut scratch.merge,
+            );
+        }
+        for (face, list) in lists.enumerate() {
+            let bit = 1 << face;
+            if scratch.decisions.iter().any(|(entity, mask)| {
+                list.entities.binary_search(entity).is_ok() != (mask & bit != 0)
+            }) {
+                reconcile_sorted_visibility(
+                    &mut list.entities,
+                    &scratch.decisions,
+                    |mask| usize::from(mask & bit != 0),
+                    &mut scratch.merge,
+                );
+                membership_changed = true;
+            }
+        }
+    } else {
+        casters.par_iter().for_each_init(
+            || scratch.queues.borrow_local_mut(),
+            |queue, data| {
+                let entity = data.0;
+                let mask = test(data);
+                if mask != 0 {
+                    queue.push((entity, mask));
+                }
+            },
+        );
+        for queue in scratch.queues.iter_mut() {
+            scratch.decisions.append(queue);
+        }
+        scratch
+            .decisions
+            .sort_unstable_by_key(|(entity, _)| *entity);
+        union.clear();
+        union.extend(scratch.decisions.iter().map(|(entity, _)| *entity));
+        for (face, list) in lists.enumerate() {
+            let selected = || {
+                scratch
+                    .decisions
+                    .iter()
+                    .filter_map(|(entity, mask)| (mask & (1 << face) != 0).then_some(*entity))
+            };
+            if !list.entities.iter().copied().eq(selected()) {
+                list.entities.clear();
+                list.entities.extend(selected());
+                membership_changed = true;
+            }
+        }
+    }
+
+    view.center = sphere.center;
+    view.range = sphere.radius;
+    view.layers.clone_from(layers);
+    view.frusta.clear();
+    view.frusta.extend_from_slice(frusta);
+    view.origin = origin;
+    membership_changed
+}
+
 /// Updates the visibility for [`PointLight`]s and [`SpotLight`]s so that shadow
-/// map rendering can work.
-///
-/// This only processes entities without [`NoCpuCulling`]. Entities with
-/// [`NoCpuCulling`] receive no view-specific processing in the main world.
+/// map rendering can work. Retains exact memberships for unchanged light views
+/// and reconciles changed casters, while republishing their per-frame visibility union.
+/// Entities with [`NoCpuCulling`] receive no view-specific processing in the main world.
 pub fn check_point_light_mesh_visibility(
+    mut commands: Commands,
     visible_point_lights: Query<&VisibleEntities>,
     mut point_lights: Query<(
-        &PointLight,
+        Ref<PointLight>,
         &GlobalTransform,
         &CubemapFrusta,
         &mut CubemapVisibleEntities,
         Option<&RenderLayers>,
     )>,
     mut spot_lights: Query<(
-        &SpotLight,
+        Ref<SpotLight>,
         &GlobalTransform,
         &Frustum,
         &mut VisibleMeshEntities,
         Option<&RenderLayers>,
     )>,
-    mut visible_entity_query: Query<
+    casters: LocalCasterQuery,
+    changed: Query<
+        Entity,
         (
-            Entity,
-            &InheritedVisibility,
-            &mut ViewVisibility,
-            Option<&RenderLayers>,
-            Option<&Aabb>,
-            Option<&GlobalTransform>,
-            Has<VisibilityRange>,
-            Has<NoFrustumCulling>,
-        ),
-        (
-            Without<NotShadowCaster>,
-            Without<DirectionalLight>,
-            Without<NoCpuCulling>,
             With<Mesh3d>,
+            With<InheritedVisibility>,
+            Or<(
+                Changed<Mesh3d>,
+                Changed<InheritedVisibility>,
+                Changed<RenderLayers>,
+                Added<ViewVisibility>,
+                Changed<Aabb>,
+                Changed<GlobalTransform>,
+                Added<NotShadowCaster>,
+                Added<DirectionalLight>,
+                Added<NoCpuCulling>,
+                Added<NoFrustumCulling>,
+                With<VisibilityRange>,
+            )>,
         ),
     >,
+    (
+        mut removed_mesh,
+        mut removed_inherited,
+        mut removed_layers,
+        mut removed_aabb,
+        mut removed_transform,
+        mut removed_not_caster,
+        mut removed_light,
+        mut removed_no_cpu,
+        mut removed_no_frustum,
+        mut removed_range,
+        mut removed_visibility,
+    ): (
+        RemovedComponents<Mesh3d>,
+        RemovedComponents<InheritedVisibility>,
+        RemovedComponents<RenderLayers>,
+        RemovedComponents<Aabb>,
+        RemovedComponents<GlobalTransform>,
+        RemovedComponents<NotShadowCaster>,
+        RemovedComponents<DirectionalLight>,
+        RemovedComponents<NoCpuCulling>,
+        RemovedComponents<NoFrustumCulling>,
+        RemovedComponents<VisibilityRange>,
+        RemovedComponents<ViewVisibility>,
+    ),
     mut camera_query: Query<(Entity, &RenderTarget), With<Camera>>,
     mut shadow_lod_origin_query: Query<Entity, With<ShadowLodOrigin>>,
     mut point_and_spot_light_query: Query<Entity, Or<(With<PointLight>, With<SpotLight>)>>,
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
-    mut cubemap_visible_entities_queue: Local<Parallel<[Vec<Entity>; 6]>>,
-    mut spot_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
+    mut cache: Local<LocalShadowVisibilityCache>,
     mut checked_lights: Local<EntityHashSet>,
 ) {
+    let cache = &mut *cache;
     checked_lights.clear();
-
-    let shadow_lod_origin = get_shadow_lod_origin(
+    cache.dirty.clear();
+    cache.dirty.extend(
+        removed_mesh
+            .read()
+            .chain(removed_inherited.read())
+            .chain(removed_layers.read())
+            .chain(removed_aabb.read())
+            .chain(removed_transform.read())
+            .chain(removed_not_caster.read())
+            .chain(removed_light.read())
+            .chain(removed_no_cpu.read())
+            .chain(removed_no_frustum.read())
+            .chain(removed_range.read())
+            .chain(removed_visibility.read()),
+    );
+    let origin = get_shadow_lod_origin(
         camera_query.transmute_lens_filtered(),
         shadow_lod_origin_query.transmute_lens_filtered(),
         point_and_spot_light_query.transmute_lens_filtered(),
     );
+    let ranges = visible_entity_ranges.as_deref();
+    let mut collected = false;
+    let mut publication = Vec::new();
 
-    let visible_entity_ranges = visible_entity_ranges.as_deref();
     for visible_lights in &visible_point_lights {
         for &light_entity in visible_lights.get(TypeId::of::<ClusterVisibilityClass>()) {
             if !checked_lights.insert(light_entity) {
                 continue;
             }
-
-            // Point lights
-            if let Ok((
-                point_light,
-                transform,
-                cubemap_frusta,
-                mut cubemap_visible_entities,
-                maybe_view_mask,
-            )) = point_lights.get_mut(light_entity)
+            if let Ok((light, transform, frusta, mut lists, layers)) =
+                point_lights.get_mut(light_entity)
             {
-                // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
-                if !point_light.shadow_maps_enabled {
+                if light.shadow_maps_enabled {
+                    let sphere = Sphere {
+                        center: Vec3A::from(transform.translation()),
+                        radius: light.range,
+                    };
+                    let layers = layers.unwrap_or_default();
+                    let frusta = &frusta.frusta;
+                    let stable = !light.is_added()
+                        && !lists.is_changed()
+                        && cache
+                            .points
+                            .get(&light_entity)
+                            .is_some_and(|view| view.matches(&sphere, layers, frusta, origin));
+                    if stable && !collected {
+                        cache.dirty.extend(changed.iter());
+                        cache.dirty.sort_unstable();
+                        cache.dirty.dedup();
+                        collected = true;
+                    }
+                    let view = cache.points.entry(light_entity).or_default();
+                    if !stable || !cache.dirty.is_empty() {
+                        if update_local_shadow_view(
+                            view,
+                            stable,
+                            &cache.dirty,
+                            &mut cache.scratch,
+                            &sphere,
+                            layers,
+                            frusta,
+                            origin,
+                            ranges,
+                            &casters,
+                            lists.bypass_change_detection().iter_mut(),
+                        ) {
+                            lists.set_changed();
+                        }
+                    }
+                    publication.push(Arc::clone(&view.union));
+                } else {
+                    cache.points.remove(&light_entity);
+                    cache.spots.remove(&light_entity);
                     continue;
                 }
-
-                let view_mask = maybe_view_mask.unwrap_or_default();
-                let light_sphere = Sphere {
-                    center: Vec3A::from(transform.translation()),
-                    radius: point_light.range,
-                };
-
-                visible_entity_query.par_iter_mut().for_each_init(
-                    || cubemap_visible_entities_queue.borrow_local_mut(),
-                    |cubemap_visible_entities_local_queue,
-                     (
-                        entity,
-                        inherited_visibility,
-                        mut view_visibility,
-                        maybe_entity_mask,
-                        maybe_aabb,
-                        maybe_transform,
-                        has_visibility_range,
-                        has_no_frustum_culling,
-                    )| {
-                        if !inherited_visibility.get() {
-                            return;
-                        }
-                        let entity_mask = maybe_entity_mask.unwrap_or_default();
-                        if !view_mask.intersects(entity_mask) {
-                            return;
-                        }
-                        if has_visibility_range
-                            && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                                shadow_lod_origin.is_none_or(|shadow_lod_origin| {
-                                    !visible_entity_ranges
-                                        .entity_is_in_range_of_view(entity, shadow_lod_origin)
-                                })
-                            })
-                        {
-                            return;
-                        }
-
-                        // If we have an aabb and transform, do frustum culling
-                        if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
-                            let model_to_world = transform.affine();
-                            // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
-                            if !has_no_frustum_culling
-                                && !light_sphere.intersects_obb(aabb, &model_to_world)
-                            {
-                                return;
-                            }
-
-                            for (frustum, visible_entities) in cubemap_frusta
-                                .iter()
-                                .zip(cubemap_visible_entities_local_queue.iter_mut())
-                            {
-                                if has_no_frustum_culling
-                                    || frustum.intersects_obb(aabb, &model_to_world, true, true)
-                                {
-                                    view_visibility.set_visible();
-                                    visible_entities.push(entity);
-                                }
-                            }
-                        } else {
-                            view_visibility.set_visible();
-                            for visible_entities in cubemap_visible_entities_local_queue.iter_mut()
-                            {
-                                visible_entities.push(entity);
-                            }
-                        }
-                    },
-                );
-
-                // Collect the entities from each parallel queue.
-                for (view_dest_index, view_dest) in cubemap_visible_entities.iter_mut().enumerate()
-                {
-                    view_dest.entities.clear();
-                    for thread_entity_queue in cubemap_visible_entities_queue.iter_mut() {
-                        view_dest
-                            .entities
-                            .append(&mut thread_entity_queue[view_dest_index]);
-                    }
-                    view_dest.shrink();
-                    view_dest.entities.sort_unstable();
-                }
             }
-
-            // Spot lights
-            if let Ok((point_light, transform, frustum, mut visible_entities, maybe_view_mask)) =
+            if let Ok((light, transform, frustum, mut list, layers)) =
                 spot_lights.get_mut(light_entity)
             {
-                // NOTE: If shadow mapping is disabled for the light then it must have no visible entities
-                if !point_light.shadow_maps_enabled {
-                    continue;
+                if light.shadow_maps_enabled {
+                    let sphere = Sphere {
+                        center: Vec3A::from(transform.translation()),
+                        radius: light.range,
+                    };
+                    let layers = layers.unwrap_or_default();
+                    let frusta = core::slice::from_ref(frustum);
+                    let stable = !light.is_added()
+                        && !list.is_changed()
+                        && cache
+                            .spots
+                            .get(&light_entity)
+                            .is_some_and(|view| view.matches(&sphere, layers, frusta, origin));
+                    if stable && !collected {
+                        cache.dirty.extend(changed.iter());
+                        cache.dirty.sort_unstable();
+                        cache.dirty.dedup();
+                        collected = true;
+                    }
+                    let view = cache.spots.entry(light_entity).or_default();
+                    if !stable || !cache.dirty.is_empty() {
+                        if update_local_shadow_view(
+                            view,
+                            stable,
+                            &cache.dirty,
+                            &mut cache.scratch,
+                            &sphere,
+                            layers,
+                            frusta,
+                            origin,
+                            ranges,
+                            &casters,
+                            core::iter::once(list.bypass_change_detection()),
+                        ) {
+                            list.set_changed();
+                        }
+                    }
+                    publication.push(Arc::clone(&view.union));
+                } else {
+                    cache.spots.remove(&light_entity);
                 }
-
-                let view_mask = maybe_view_mask.unwrap_or_default();
-                let light_sphere = Sphere {
-                    center: Vec3A::from(transform.translation()),
-                    radius: point_light.range,
-                };
-
-                visible_entity_query.par_iter_mut().for_each_init(
-                    || spot_visible_entities_queue.borrow_local_mut(),
-                    |spot_visible_entities_local_queue,
-                     (
-                        entity,
-                        inherited_visibility,
-                        mut view_visibility,
-                        maybe_entity_mask,
-                        maybe_aabb,
-                        maybe_transform,
-                        has_visibility_range,
-                        has_no_frustum_culling,
-                    )| {
-                        if !inherited_visibility.get() {
-                            return;
-                        }
-
-                        let entity_mask = maybe_entity_mask.unwrap_or_default();
-                        if !view_mask.intersects(entity_mask) {
-                            return;
-                        }
-                        // Check visibility ranges.
-                        if has_visibility_range
-                            && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                                shadow_lod_origin.is_none_or(|shadow_lod_origin| {
-                                    !visible_entity_ranges
-                                        .entity_is_in_range_of_view(entity, shadow_lod_origin)
-                                })
-                            })
-                        {
-                            return;
-                        }
-
-                        if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
-                            let model_to_world = transform.affine();
-                            // Do a cheap sphere vs obb test to prune out most meshes outside the sphere of the light
-                            if !has_no_frustum_culling
-                                && !light_sphere.intersects_obb(aabb, &model_to_world)
-                            {
-                                return;
-                            }
-
-                            if has_no_frustum_culling
-                                || frustum.intersects_obb(aabb, &model_to_world, true, true)
-                            {
-                                view_visibility.set_visible();
-                                spot_visible_entities_local_queue.push(entity);
-                            }
-                        } else {
-                            view_visibility.set_visible();
-                            spot_visible_entities_local_queue.push(entity);
-                        }
-                    },
-                );
-
-                visible_entities.entities.clear();
-                for thread_entity_queue in spot_visible_entities_queue.iter_mut() {
-                    visible_entities.entities.append(thread_entity_queue);
-                }
-                visible_entities.shrink();
-                visible_entities.entities.sort_unstable();
             }
         }
+    }
+    cache
+        .points
+        .retain(|entity, _| checked_lights.contains(entity) && point_lights.get(*entity).is_ok());
+    cache
+        .spots
+        .retain(|entity, _| checked_lights.contains(entity) && spot_lights.get(*entity).is_ok());
+
+    if !publication.is_empty() {
+        commands.queue(move |world: &mut World| {
+            let mut query = world.query::<&mut ViewVisibility>();
+            for entities in publication {
+                let mut iter = query.iter_many_mut(world, entities.iter()).matched();
+                while let Some(mut visibility) = iter.fetch_next() {
+                    visibility.set_visible();
+                }
+            }
+        });
     }
 }
 
@@ -1499,6 +1683,161 @@ mod directional_shadow_receiver_tests {
             .unwrap()
             .get(class)
             .is_empty());
+    }
+
+    #[test]
+    fn incremental_local_visibility_republishes_point_faces_and_spot_membership() {
+        let mut app = App::new();
+        app.add_plugins(bevy_app::TaskPoolPlugin::default());
+        let world = app.world_mut();
+        let spot = world
+            .spawn((
+                SpotLight {
+                    shadow_maps_enabled: true,
+                    ..Default::default()
+                },
+                Frustum::default(),
+                VisibleMeshEntities::default(),
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        let point = world
+            .spawn((
+                PointLight {
+                    shadow_maps_enabled: true,
+                    ..Default::default()
+                },
+                CubemapFrusta::default(),
+                CubemapVisibleEntities::default(),
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        let mut visible = VisibleEntities::default();
+        visible.push(spot, TypeId::of::<ClusterVisibilityClass>());
+        visible.push(point, TypeId::of::<ClusterVisibilityClass>());
+        let camera = world.spawn(visible).id();
+        let entities: Vec<_> = (0..16)
+            .map(|_| {
+                world
+                    .spawn((
+                        Mesh3d(Default::default()),
+                        InheritedVisibility::VISIBLE,
+                        ViewVisibility::HIDDEN,
+                        NoFrustumCulling,
+                        GlobalTransform::IDENTITY,
+                    ))
+                    .id()
+            })
+            .collect();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(check_point_light_mesh_visibility);
+        schedule.run(world);
+        let spot_list = |world: &World| {
+            world
+                .get::<VisibleMeshEntities>(spot)
+                .unwrap()
+                .entities
+                .clone()
+        };
+        let point_list = |world: &World| {
+            world
+                .get::<CubemapVisibleEntities>(point)
+                .unwrap()
+                .iter()
+                .map(|face| face.entities.clone())
+                .collect::<Vec<_>>()
+        };
+        let initial = spot_list(world);
+        assert_eq!(initial.len(), entities.len());
+        assert!(point_list(world).iter().all(|face| face == &initial));
+        let tick = world
+            .entity(spot)
+            .get_ref::<VisibleMeshEntities>()
+            .unwrap()
+            .last_changed();
+        for &entity in &entities {
+            *world
+                .get_mut::<ViewVisibility>(entity)
+                .unwrap()
+                .bypass_change_detection() = ViewVisibility::HIDDEN;
+        }
+        schedule.run(world);
+        assert_eq!(
+            world
+                .entity(spot)
+                .get_ref::<VisibleMeshEntities>()
+                .unwrap()
+                .last_changed(),
+            tick
+        );
+        assert!(entities
+            .iter()
+            .all(|&e| world.get::<ViewVisibility>(e).unwrap().get()));
+
+        let first = entities[0];
+        world
+            .entity_mut(first)
+            .insert(GlobalTransform::from_translation(Vec3::X));
+        schedule.run(world);
+        assert_eq!(
+            world
+                .entity(spot)
+                .get_ref::<VisibleMeshEntities>()
+                .unwrap()
+                .last_changed(),
+            tick
+        );
+        world.entity_mut(first).insert(NotShadowCaster);
+        *world
+            .get_mut::<ViewVisibility>(first)
+            .unwrap()
+            .bypass_change_detection() = ViewVisibility::HIDDEN;
+        schedule.run(world);
+        assert!(!spot_list(world).contains(&first));
+        assert!(point_list(world).iter().all(|face| !face.contains(&first)));
+        assert!(!world.get::<ViewVisibility>(first).unwrap().get());
+        world.entity_mut(first).remove::<NotShadowCaster>();
+        schedule.run(world);
+        assert_eq!(spot_list(world), initial);
+        world.entity_mut(first).insert(RenderLayers::layer(1));
+        schedule.run(world);
+        assert!(!spot_list(world).contains(&first));
+        assert!(point_list(world).iter().all(|face| !face.contains(&first)));
+        world.entity_mut(first).remove::<RenderLayers>();
+        schedule.run(world);
+        assert_eq!(spot_list(world), initial);
+        world.despawn(first);
+        schedule.run(world);
+        assert!(!spot_list(world).contains(&first));
+
+        // An inactive light cannot reuse membership after changes while absent.
+        world
+            .get_mut::<VisibleEntities>(camera)
+            .unwrap()
+            .clear(TypeId::of::<ClusterVisibilityClass>());
+        schedule.run(world);
+        let second = entities[1];
+        world.entity_mut(second).insert(NotShadowCaster);
+        schedule.run(world);
+        world
+            .get_mut::<VisibleEntities>(camera)
+            .unwrap()
+            .push(spot, TypeId::of::<ClusterVisibilityClass>());
+        schedule.run(world);
+        assert!(!spot_list(world).contains(&second));
+        assert_eq!(spot_list(world).len(), entities.len() - 2);
+        world
+            .get_mut::<SpotLight>(spot)
+            .unwrap()
+            .shadow_maps_enabled = false;
+        schedule.run(world);
+        world.entity_mut(second).remove::<NotShadowCaster>();
+        world
+            .get_mut::<SpotLight>(spot)
+            .unwrap()
+            .shadow_maps_enabled = true;
+        schedule.run(world);
+        assert_eq!(spot_list(world).len(), entities.len() - 1);
     }
 
     #[test]
