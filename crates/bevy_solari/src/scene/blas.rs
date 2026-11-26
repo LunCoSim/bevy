@@ -1,11 +1,12 @@
+use super::RaytracingMesh3d;
 use alloc::collections::VecDeque;
 use bevy_asset::AssetId;
 use bevy_ecs::{
     resource::Resource,
-    system::{Res, ResMut},
+    system::{Query, Res, ResMut},
 };
 use bevy_mesh::{Indices, Mesh};
-use bevy_platform::collections::HashMap;
+use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     diagnostic::{DiagnosticsRecorder, RecordDiagnostics},
     mesh::{
@@ -29,6 +30,9 @@ const TLAS_BUILDS_BEFORE_DELETION_ALLOWED: usize = 2;
 #[derive(Resource, Default)]
 pub struct BlasManager {
     blas: HashMap<AssetId<Mesh>, Blas>,
+    /// Compatibility of resident mesh assets, independent of whether any instance currently
+    /// requests a BLAS. A mesh can acquire its first raytracing instance long after extraction.
+    compatible_meshes: HashSet<AssetId<Mesh>>,
     compaction_queue: VecDeque<(AssetId<Mesh>, u32, bool)>,
     changed: Vec<AssetId<Mesh>>,
     /// BLAS that are pending deletion, one batch per TLAS build. The back batch collects
@@ -65,11 +69,24 @@ impl BlasManager {
     }
 
     fn remove(&mut self, mesh: AssetId<Mesh>) {
-        self.changed.push(mesh);
-
+        self.compatible_meshes.remove(&mesh);
         if let Some(removed) = self.blas.remove(&mesh) {
+            self.compaction_queue.retain(|(id, _, _)| *id != mesh);
+            self.changed.push(mesh);
             self.retire(removed);
         }
+    }
+
+    fn observe_mesh(&mut self, id: AssetId<Mesh>, mesh: &Mesh) {
+        if is_mesh_raytracing_compatible(mesh) {
+            self.compatible_meshes.insert(id);
+        } else {
+            self.compatible_meshes.remove(&id);
+        }
+    }
+
+    fn needs_build(&self, id: AssetId<Mesh>) -> bool {
+        !self.blas.contains_key(&id) && self.compatible_meshes.contains(&id)
     }
 
     fn retire(&mut self, blas: Blas) {
@@ -83,6 +100,7 @@ impl BlasManager {
 pub fn prepare_raytracing_blas(
     mut blas_manager: ResMut<BlasManager>,
     extracted_meshes: Res<ExtractedAssets<RenderMesh>>,
+    raytracing_instances: Query<&RaytracingMesh3d>,
     mesh_allocator: Res<MeshAllocator>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -99,30 +117,38 @@ pub fn prepare_raytracing_blas(
         blas_manager.remove(*asset_id);
     }
 
-    if extracted_meshes.extracted.is_empty() {
-        return;
+    // Keep only compatibility metadata for extracted assets. Geometry already resides in the
+    // mesh allocator, so a later raytracing instance does not need the source mesh again.
+    for (asset_id, mesh) in &extracted_meshes.extracted {
+        blas_manager.observe_mesh(*asset_id, mesh);
     }
 
-    // Create new BLAS for added or changed meshes
-    let blas_resources = extracted_meshes
-        .extracted
-        .iter()
-        .filter(|(_, mesh)| is_mesh_raytracing_compatible(mesh))
-        .map(|(asset_id, _)| {
-            let vertex_slice = mesh_allocator.mesh_vertex_slice(asset_id).unwrap();
-            let index_slice = mesh_allocator.mesh_index_slice(asset_id).unwrap();
+    // Build only for meshes with a real raytracing instance. Multiple instances of one
+    // mesh share the BLAS; already built assets stay resident until modified or retired.
+    let mut blas_resources = Vec::new();
+    for instance in &raytracing_instances {
+        let asset_id = instance.0.id();
+        if !blas_manager.needs_build(asset_id) {
+            continue;
+        }
+        let (Some(vertex_slice), Some(index_slice)) = (
+            mesh_allocator.mesh_vertex_slice(&asset_id),
+            mesh_allocator.mesh_index_slice(&asset_id),
+        ) else {
+            continue;
+        };
+        let (blas, blas_size) =
+            allocate_blas(&vertex_slice, &index_slice, &asset_id, &render_device);
+        blas_manager.insert(asset_id, blas);
+        blas_manager
+            .compaction_queue
+            .push_back((asset_id, blas_size.vertex_count, false));
+        blas_resources.push((asset_id, vertex_slice, index_slice, blas_size));
+    }
 
-            let (blas, blas_size) =
-                allocate_blas(&vertex_slice, &index_slice, asset_id, &render_device);
-
-            blas_manager.insert(*asset_id, blas);
-            blas_manager
-                .compaction_queue
-                .push_back((*asset_id, blas_size.vertex_count, false));
-
-            (*asset_id, vertex_slice, index_slice, blas_size)
-        })
-        .collect::<Vec<_>>();
+    if blas_resources.is_empty() {
+        return;
+    }
 
     // Build geometry into each BLAS
     let build_entries = blas_resources
@@ -259,4 +285,47 @@ fn is_mesh_raytracing_compatible(mesh: &Mesh) -> bool {
         ]);
     let indexed_32 = matches!(mesh.indices(), Some(Indices::U32(..)));
     mesh.enable_raytracing && triangle_list && vertex_attributes && indexed_32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_asset::{Assets, RenderAssetUsages};
+
+    fn compatible_mesh() -> Mesh {
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.enable_raytracing = true;
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0; 3]; 3]);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0; 3]; 3]);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0; 2]; 3]);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[0.0; 4]; 3]);
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
+        mesh
+    }
+
+    #[test]
+    fn resident_mesh_compatibility_survives_until_late_instance_demand() {
+        let mut assets = Assets::<Mesh>::default();
+        let handle = assets.add(compatible_mesh());
+        let id = handle.id();
+        let mut manager = BlasManager::default();
+        assert!(!manager.needs_build(id));
+        manager.observe_mesh(id, assets.get(id).unwrap());
+        assert!(manager.needs_build(id));
+        // No instance requested a build at extraction time.
+        assert!(manager.get(&id).is_none());
+        // A later instance can request the resident geometry without another extraction.
+        assert!(manager.needs_build(id));
+        manager.remove(id);
+        assert!(!manager.needs_build(id));
+        let mut incompatible = compatible_mesh();
+        incompatible.enable_raytracing = false;
+        manager.observe_mesh(id, &incompatible);
+        assert!(!manager.needs_build(id));
+        manager.observe_mesh(id, &compatible_mesh());
+        assert!(manager.needs_build(id));
+    }
 }
