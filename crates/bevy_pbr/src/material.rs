@@ -654,6 +654,9 @@ pub struct RenderMaterialInstances {
     /// [`RenderMaterialInstances::instances`] when the entities and/or required
     /// components are removed.
     pub current_change_tick: Tick,
+    /// Identities whose material association was published or retired during
+    /// this extraction. The CPU mesh owner consumes this after both sweeps.
+    pub(crate) changed_entities: Vec<MainEntity>,
 }
 
 impl RenderMaterialInstances {
@@ -745,6 +748,11 @@ fn mark_meshes_as_changed_if_their_materials_changed<M>(
     });
 }
 
+/// Starts a new material-association publication, retaining the delta buffer.
+pub(crate) fn begin_material_extraction(mut materials: ResMut<RenderMaterialInstances>) {
+    materials.changed_entities.clear();
+}
+
 /// Fills the [`RenderMaterialInstances`] resources from the meshes in the
 /// scene.
 fn extract_mesh_materials<M: Material>(
@@ -759,18 +767,21 @@ fn extract_mesh_materials<M: Material>(
     let last_change_tick = material_instances.current_change_tick;
 
     for (entity, view_visibility, material) in &changed_meshes_query {
+        let entity = MainEntity::from(entity);
         if view_visibility.get() {
-            material_instances.instances.insert(
-                entity.into(),
+            let asset_id = material.id().untyped();
+            let previous = material_instances.instances.insert(
+                entity,
                 RenderMaterialInstance {
-                    asset_id: material.id().untyped(),
+                    asset_id,
                     last_change_tick,
                 },
             );
-        } else {
-            material_instances
-                .instances
-                .remove(&MainEntity::from(entity));
+            if previous.is_none_or(|previous| previous.asset_id != asset_id) {
+                material_instances.changed_entities.push(entity);
+            }
+        } else if material_instances.instances.remove(&entity).is_some() {
+            material_instances.changed_entities.push(entity);
         }
     }
 }
@@ -802,6 +813,7 @@ fn early_sweep_material_instances<M>(
             // Only sweep the entry if it wasn't updated this frame.
             if occupied_entry.get().last_change_tick != last_change_tick {
                 occupied_entry.remove();
+                material_instances.changed_entities.push(entity.into());
             }
         }
     }
@@ -826,6 +838,7 @@ pub fn late_sweep_material_instances(
             // re-added in the same frame.
             if occupied_entry.get().last_change_tick != last_change_tick {
                 occupied_entry.remove();
+                material_instances.changed_entities.push(entity.into());
             }
         }
     }
@@ -1842,5 +1855,78 @@ impl MaterialPropertiesExt for MaterialProperties {
         // So we have to disable the optimization for depth only prepass and always bind the material's bind group.
         self.get_shader(PrepassVertexShader).is_some()
             || self.get_shader(PrepassFragmentShader).is_some()
+    }
+}
+
+#[cfg(test)]
+mod incremental_material_tests {
+    use super::*;
+    use bevy_asset::Handle;
+    use bevy_render::MainWorld;
+
+    #[test]
+    fn cpu_incremental_material_association_deltas_follow_final_state() {
+        let mut main = MainWorld::default();
+        let original = Handle::<StandardMaterial>::default();
+        let replacement = Handle::<StandardMaterial>::Uuid(
+            bevy_asset::uuid::Uuid::from_u128(18),
+            Default::default(),
+        );
+        let entity = main
+            .spawn((
+                Mesh3d(Handle::default()),
+                ViewVisibility::VISIBLE,
+                MeshMaterial3d(original.clone()),
+            ))
+            .id();
+        let main_entity = MainEntity::from(entity);
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.init_resource::<RenderMaterialInstances>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                begin_material_extraction,
+                extract_mesh_materials::<StandardMaterial>,
+                early_sweep_material_instances::<StandardMaterial>,
+                late_sweep_material_instances,
+            )
+                .chain(),
+        );
+        schedule.run(&mut world);
+        assert_eq!(
+            world.resource::<RenderMaterialInstances>().changed_entities,
+            vec![main_entity]
+        );
+        world.resource_mut::<MainWorld>().clear_trackers();
+        schedule.run(&mut world);
+        assert!(world
+            .resource::<RenderMaterialInstances>()
+            .changed_entities
+            .is_empty());
+        {
+            let mut main = world.resource_mut::<MainWorld>();
+            main.clear_trackers();
+            main.entity_mut(entity)
+                .remove::<MeshMaterial3d<StandardMaterial>>()
+                .insert(MeshMaterial3d(replacement.clone()));
+        }
+        schedule.run(&mut world);
+        let materials = world.resource::<RenderMaterialInstances>();
+        assert_eq!(
+            materials.mesh_material(main_entity),
+            Some(replacement.id().untyped())
+        );
+        assert_eq!(materials.changed_entities, vec![main_entity]);
+        {
+            let mut main = world.resource_mut::<MainWorld>();
+            main.clear_trackers();
+            main.entity_mut(entity)
+                .remove::<MeshMaterial3d<StandardMaterial>>();
+        }
+        schedule.run(&mut world);
+        let materials = world.resource::<RenderMaterialInstances>();
+        assert!(materials.mesh_material(main_entity).is_none());
+        assert_eq!(materials.changed_entities, vec![main_entity]);
     }
 }

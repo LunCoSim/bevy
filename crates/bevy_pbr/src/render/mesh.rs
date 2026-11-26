@@ -298,9 +298,13 @@ impl Plugin for MeshRenderPlugin {
             } else {
                 render_app
                     .init_gpu_resource::<no_gpu_preprocessing::BatchedInstanceBuffer<MeshUniform>>()
+                    .init_resource::<MeshesToReextractNextFrame>()
+                    .add_systems(RenderStartup, mark_all_meshes_for_reextraction)
                     .add_systems(
                         ExtractSchedule,
-                        extract_meshes_for_cpu_building.in_set(MeshExtractionSystems),
+                        extract_meshes_for_cpu_building
+                            .in_set(MeshExtractionSystems)
+                            .after(late_sweep_material_instances),
                     )
                     .add_systems(
                         Render,
@@ -341,7 +345,8 @@ impl Plugin for MeshRenderPlugin {
     }
 }
 
-/// Drains all entities from [`RenderMeshInstances`] into [`MeshesToReextractNextFrame`].
+/// Marks native mesh instances for reextraction after render startup/recovery.
+/// CPU rows remain usable for the current frame; GPU inputs must be rebuilt.
 fn mark_all_meshes_for_reextraction(
     mut render_mesh_instances: ResMut<RenderMeshInstances>,
     mut meshes_to_reextract: ResMut<MeshesToReextractNextFrame>,
@@ -349,7 +354,6 @@ fn mark_all_meshes_for_reextraction(
     match *render_mesh_instances {
         RenderMeshInstances::CpuBuilding(ref mut cpu) => {
             meshes_to_reextract.extend(cpu.keys());
-            cpu.clear();
         }
         RenderMeshInstances::GpuBuilding(ref mut gpu) => {
             meshes_to_reextract.extend(gpu.keys());
@@ -835,6 +839,9 @@ bitflags::bitflags! {
     }
 }
 
+const CPU_FRAME_MOTION_FLAGS: RenderMeshInstanceFlags =
+    RenderMeshInstanceFlags::HAS_PREVIOUS_SKIN.union(RenderMeshInstanceFlags::HAS_PREVIOUS_MORPH);
+
 /// CPU data that the render world keeps for each entity, when *not* using GPU
 /// mesh uniform building.
 #[derive(Deref, DerefMut)]
@@ -1229,6 +1236,9 @@ pub struct RenderMeshInstancesCpu {
     indices: MainEntityHashMap<usize>,
     instances: Vec<(MainEntity, RenderMeshInstanceCpu)>,
     prepared: Vec<PreparedCpuMeshInstance>,
+    /// CPU motion flags are recomputed every render frame, even for retained rows.
+    motion_flagged_entities: Vec<MainEntity>,
+    extraction_initialized: bool,
 }
 
 /// Information that the render world keeps about each entity that contains a
@@ -1298,14 +1308,44 @@ impl RenderMeshInstancesCpu {
         self.indices.keys()
     }
 
-    fn get_mut(&mut self, entity: &MainEntity) -> Option<&mut RenderMeshInstanceCpu> {
-        Some(&mut self.instances[*self.indices.get(entity)?].1)
-    }
-
     fn clear(&mut self) {
         self.indices.clear();
         self.instances.clear();
         self.prepared.clear();
+        self.motion_flagged_entities.clear();
+        self.extraction_initialized = false;
+    }
+
+    fn begin_frame(&mut self) {
+        self.prepared.clear();
+        // Only touch rows whose transient flags were set last frame.
+        for entity in self.motion_flagged_entities.drain(..) {
+            if let Some(&index) = self.indices.get(&entity) {
+                let instance = &self.instances[index].1;
+                instance.set_flags(instance.flags().difference(CPU_FRAME_MOTION_FLAGS));
+            }
+        }
+    }
+
+    fn remove(&mut self, entity: MainEntity) {
+        let Some(index) = self.indices.remove(&entity) else {
+            return;
+        };
+        self.instances.swap_remove(index);
+        if let Some((moved, _)) = self.instances.get(index) {
+            // A dense swap preserves the exact main-world identity of the row.
+            *self
+                .indices
+                .get_mut(moved)
+                .expect("dense mesh index must exist") = index;
+        }
+    }
+
+    fn apply_extracted(&mut self, entity: MainEntity, instance: Option<RenderMeshInstanceCpu>) {
+        match instance {
+            Some(instance) => self.insert(entity, instance),
+            None => self.remove(entity),
+        }
     }
 
     fn insert(&mut self, entity: MainEntity, instance: RenderMeshInstanceCpu) {
@@ -1339,8 +1379,14 @@ impl RenderMeshInstancesCpu {
     /// Inserts the given flags into the render mesh instance data for the given
     /// mesh.
     fn insert_mesh_instance_flags(&mut self, entity: MainEntity, flags: RenderMeshInstanceFlags) {
-        if let Some(instance) = self.get_mut(&entity) {
-            instance.set_flags(instance.flags() | flags);
+        if let Some(instance) = self.get(&entity) {
+            let previous = instance.flags();
+            instance.set_flags(previous | flags);
+            if flags.intersects(CPU_FRAME_MOTION_FLAGS)
+                && !previous.intersects(CPU_FRAME_MOTION_FLAGS)
+            {
+                self.motion_flagged_entities.push(entity);
+            }
         }
     }
 }
@@ -1855,121 +1901,241 @@ impl RenderGpuCulledEntities {
     }
 }
 
-/// Extracts meshes from the main world into the render world, populating the
-/// [`RenderMeshInstances`].
-///
-/// This is the variant of the system that runs when we're *not* using GPU
-/// [`MeshUniform`] building.
+/// All main-world fields that determine a CPU mesh extraction row.
+type CpuMeshExtractionQuery = (
+    Entity,
+    Read<ViewVisibility>,
+    Read<GlobalTransform>,
+    Option<Read<PreviousGlobalTransform>>,
+    Read<Mesh3d>,
+    Option<Read<MeshTag>>,
+    (
+        Has<NoFrustumCulling>,
+        Has<NotShadowReceiver>,
+        Has<TransmittedShadowReceiver>,
+        Has<NotShadowCaster>,
+        Has<NoAutomaticBatching>,
+    ),
+    Option<Read<VisibilityRange>>,
+    Option<Read<RenderLayers>>,
+);
+
+/// Extracts changed CPU mesh rows while retaining the visible dense instance
+/// inventory. Required and optional component removals use the same read path.
 pub fn extract_meshes_for_cpu_building(
     mut render_mesh_instances: ResMut<RenderMeshInstances>,
     mesh_material_ids: Res<RenderMaterialInstances>,
     render_material_bindings: Res<RenderMaterialBindings>,
     render_visibility_ranges: Res<RenderVisibilityRanges>,
-    mut render_mesh_instance_queues: Local<Parallel<Vec<(Entity, RenderMeshInstanceCpu)>>>,
-    meshes_query: Extract<
-        Query<(
-            Entity,
-            &ViewVisibility,
-            &GlobalTransform,
-            Option<&PreviousGlobalTransform>,
-            &Mesh3d,
-            Option<&MeshTag>,
-            Has<NoFrustumCulling>,
-            Has<NotShadowReceiver>,
-            Has<TransmittedShadowReceiver>,
-            Has<NotShadowCaster>,
-            Has<NoAutomaticBatching>,
-            Option<&VisibilityRange>,
-            Option<&RenderLayers>,
-        )>,
+    mut render_mesh_instance_queues: Local<Parallel<Vec<(Entity, Option<RenderMeshInstanceCpu>)>>>,
+    changed_meshes_query: Extract<
+        Query<
+            CpuMeshExtractionQuery,
+            Or<(
+                Changed<ViewVisibility>,
+                Changed<GlobalTransform>,
+                Changed<PreviousGlobalTransform>,
+                Changed<Mesh3d>,
+                Changed<MeshTag>,
+                Or<(
+                    Changed<NoFrustumCulling>,
+                    Changed<NotShadowReceiver>,
+                    Changed<TransmittedShadowReceiver>,
+                    Changed<NotShadowCaster>,
+                    Changed<NoAutomaticBatching>,
+                )>,
+                Changed<VisibilityRange>,
+                Changed<RenderLayers>,
+            )>,
+        >,
     >,
+    all_meshes_query: Extract<Query<CpuMeshExtractionQuery>>,
+    (
+        mut removed_meshes,
+        mut removed_visibility,
+        mut removed_transform,
+        mut removed_previous_transform,
+        mut removed_tag,
+        mut removed_no_frustum,
+        mut removed_not_receiver,
+        mut removed_transmitted_receiver,
+        mut removed_not_caster,
+        mut removed_no_batching,
+        mut removed_range,
+        mut removed_layers,
+    ): (
+        Extract<RemovedComponents<Mesh3d>>,
+        Extract<RemovedComponents<ViewVisibility>>,
+        Extract<RemovedComponents<GlobalTransform>>,
+        Extract<RemovedComponents<PreviousGlobalTransform>>,
+        Extract<RemovedComponents<MeshTag>>,
+        Extract<RemovedComponents<NoFrustumCulling>>,
+        Extract<RemovedComponents<NotShadowReceiver>>,
+        Extract<RemovedComponents<TransmittedShadowReceiver>>,
+        Extract<RemovedComponents<NotShadowCaster>>,
+        Extract<RemovedComponents<NoAutomaticBatching>>,
+        Extract<RemovedComponents<VisibilityRange>>,
+        Extract<RemovedComponents<RenderLayers>>,
+    ),
+    mut meshes_to_reextract_next_frame: ResMut<MeshesToReextractNextFrame>,
+    mut reextract_entities: Local<EntityHashSet>,
 ) {
-    meshes_query.par_iter().for_each_init(
-        || render_mesh_instance_queues.borrow_local_mut(),
-        |queue,
-         (
-            entity,
-            view_visibility,
-            transform,
-            previous_transform,
-            mesh,
-            tag,
+    let RenderMeshInstances::CpuBuilding(instances) = &mut *render_mesh_instances else {
+        panic!("`extract_meshes_for_cpu_building` requires CPU mesh uniform building");
+    };
+    let rebuild_all = !instances.extraction_initialized;
+    instances.begin_frame();
+
+    // Reconcile final component state after removals, including remove/re-add
+    // in the same frame and exact entity generations on despawn.
+    reextract_entities.clear();
+    reextract_entities.extend(
+        meshes_to_reextract_next_frame
+            .drain()
+            .map(|entity| *entity)
+            .chain(removed_meshes.read())
+            .chain(removed_visibility.read())
+            .chain(removed_transform.read())
+            .chain(removed_previous_transform.read())
+            .chain(removed_tag.read())
+            .chain(removed_no_frustum.read())
+            .chain(removed_not_receiver.read())
+            .chain(removed_transmitted_receiver.read())
+            .chain(removed_not_caster.read())
+            .chain(removed_no_batching.read())
+            .chain(removed_range.read())
+            .chain(removed_layers.read()),
+    );
+
+    let extract = |row: <CpuMeshExtractionQuery as QueryData>::Item<'_, '_>| {
+        extract_mesh_for_cpu_building(
+            row,
+            &mesh_material_ids,
+            &render_material_bindings,
+            &render_visibility_ranges,
+        )
+    };
+    if rebuild_all {
+        // A newly installed render-world owner must admit every visible mesh,
+        // even when the main-world components have not changed recently.
+        instances.clear();
+        for row in all_meshes_query.iter() {
+            if let Some(instance) = extract(row) {
+                instances.insert(row.0.into(), instance);
+            }
+        }
+        instances.extraction_initialized = true;
+        reextract_entities.clear();
+    } else {
+        changed_meshes_query.par_iter().for_each_init(
+            || render_mesh_instance_queues.borrow_local_mut(),
+            |queue, row| queue.push((row.0, extract(row))),
+        );
+        for queue in render_mesh_instance_queues.iter_mut() {
+            for (entity, instance) in queue.drain(..) {
+                reextract_entities.remove(entity);
+                instances.apply_extracted(entity.into(), instance);
+            }
+        }
+        for entity in reextract_entities.drain() {
+            let instance = all_meshes_query.get(entity).ok().and_then(extract);
+            instances.apply_extracted(entity.into(), instance);
+        }
+    }
+
+    // Material association and binding publication have their own owners.
+    // A changed binding table invalidates all retained slots; otherwise only
+    // association deltas need to be refreshed, including material removal.
+    let refresh_binding = |entity, instance: &RenderMeshInstanceCpu| {
+        let binding = cpu_material_binding(entity, &mesh_material_ids, &render_material_bindings);
+        let previous = instance.material_bindings_index();
+        if previous.group != binding.group || previous.slot != binding.slot {
+            instance.set_material_bindings_index(binding);
+        }
+    };
+    if !rebuild_all {
+        if render_material_bindings.is_changed() {
+            for (entity, instance) in instances.iter() {
+                refresh_binding(*entity, instance);
+            }
+        } else {
+            for &entity in &mesh_material_ids.changed_entities {
+                if let Some(instance) = instances.get(&entity) {
+                    refresh_binding(entity, instance);
+                }
+            }
+        }
+    }
+}
+
+fn cpu_material_binding(
+    entity: MainEntity,
+    materials: &RenderMaterialInstances,
+    bindings: &RenderMaterialBindings,
+) -> MaterialBindingId {
+    materials
+        .mesh_material(entity)
+        .and_then(|material| bindings.get(&material).copied())
+        .unwrap_or_default()
+}
+
+fn extract_mesh_for_cpu_building(
+    (
+        entity,
+        view_visibility,
+        transform,
+        previous_transform,
+        mesh,
+        tag,
+        (
             no_frustum_culling,
             not_shadow_receiver,
             transmitted_receiver,
             not_shadow_caster,
             no_automatic_batching,
-            visibility_range,
-            render_layers,
-        )| {
-            if !view_visibility.get() {
-                return;
-            }
-
-            let mut lod_index = None;
-            if visibility_range.is_some() {
-                lod_index = render_visibility_ranges.lod_index_for_entity(entity.into());
-            }
-
-            let mesh_flags = MeshFlags::from_components(
-                transform,
-                lod_index,
-                visibility_range,
-                no_frustum_culling,
-                not_shadow_receiver,
-                transmitted_receiver,
-            );
-
-            let mesh_material = mesh_material_ids.mesh_material(MainEntity::from(entity));
-
-            let material_bindings_index = mesh_material
-                .and_then(|mesh_material| render_material_bindings.get(&mesh_material).copied())
-                .unwrap_or_default();
-
-            let shared = RenderMeshInstanceSharedFlat::for_cpu_building(
-                previous_transform,
-                mesh,
-                tag,
-                material_bindings_index,
-                not_shadow_caster,
-                no_automatic_batching,
-            );
-
-            let world_from_local = transform.affine();
-            let previous_world_from_local = previous_transform
-                .map(|previous_transform| previous_transform.0)
-                .unwrap_or(world_from_local);
-
-            queue.push((
-                entity,
-                RenderMeshInstanceCpu {
-                    transforms: MeshTransforms {
-                        world_from_local: world_from_local.into(),
-                        previous_world_from_local: previous_world_from_local.into(),
-                        flags: mesh_flags.bits(),
-                    },
-                    shared: (&shared).into(),
-                    render_layers: render_layers.cloned(),
-                },
-            ));
-        },
-    );
-
-    // Collect the render mesh instances.
-    let RenderMeshInstances::CpuBuilding(ref mut render_mesh_instances) = *render_mesh_instances
-    else {
-        panic!(
-            "`extract_meshes_for_cpu_building` should only be called if we're using CPU \
-            `MeshUniform` building"
-        );
-    };
-
-    render_mesh_instances.clear();
-    for queue in render_mesh_instance_queues.iter_mut() {
-        for (entity, render_mesh_instance) in queue.drain(..) {
-            render_mesh_instances.insert(entity.into(), render_mesh_instance);
-        }
+        ),
+        visibility_range,
+        render_layers,
+    ): <CpuMeshExtractionQuery as QueryData>::Item<'_, '_>,
+    materials: &RenderMaterialInstances,
+    bindings: &RenderMaterialBindings,
+    render_visibility_ranges: &RenderVisibilityRanges,
+) -> Option<RenderMeshInstanceCpu> {
+    if !view_visibility.get() {
+        return None;
     }
+    let entity = MainEntity::from(entity);
+    let lod_index =
+        visibility_range.and_then(|_| render_visibility_ranges.lod_index_for_entity(entity));
+    let mesh_flags = MeshFlags::from_components(
+        transform,
+        lod_index,
+        visibility_range,
+        no_frustum_culling,
+        not_shadow_receiver,
+        transmitted_receiver,
+    );
+    let shared = RenderMeshInstanceSharedFlat::for_cpu_building(
+        previous_transform,
+        mesh,
+        tag,
+        cpu_material_binding(entity, materials, bindings),
+        not_shadow_caster,
+        no_automatic_batching,
+    );
+    let world_from_local = transform.affine();
+    let previous_world_from_local = previous_transform
+        .map(|previous_transform| previous_transform.0)
+        .unwrap_or(world_from_local);
+    Some(RenderMeshInstanceCpu {
+        transforms: MeshTransforms {
+            world_from_local: world_from_local.into(),
+            previous_world_from_local: previous_world_from_local.into(),
+            flags: mesh_flags.bits(),
+        },
+        shared: (&shared).into(),
+        render_layers: render_layers.cloned(),
+    })
 }
 
 /// All the data that we need from a mesh in the main world.
@@ -4965,6 +5131,243 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{AtomicU64ZeroBitIter, MeshPipelineKey};
+
+    #[test]
+    fn cpu_incremental_extraction_preserves_exact_lifecycle() {
+        use super::*;
+        use bevy_asset::Handle;
+        use bevy_math::Affine3A;
+        use bevy_render::MainWorld;
+
+        ComputeTaskPool::get_or_init(bevy_tasks::TaskPool::new);
+        let mut main = MainWorld::default();
+        let mesh = Mesh3d(Handle::default());
+        let a = main
+            .spawn((
+                mesh.clone(),
+                GlobalTransform::from_translation(Vec3::X),
+                ViewVisibility::VISIBLE,
+                MeshTag::new(31),
+                PreviousGlobalTransform(Affine3A::from_translation(Vec3::Y)),
+                NoFrustumCulling,
+                NotShadowReceiver,
+                TransmittedShadowReceiver,
+                NotShadowCaster,
+                NoAutomaticBatching,
+                RenderLayers::layer(3),
+                VisibilityRange::abrupt(0.0, 100.0),
+            ))
+            .id();
+        let b = main
+            .spawn((
+                mesh.clone(),
+                GlobalTransform::IDENTITY,
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        let c = main
+            .spawn((
+                mesh.clone(),
+                GlobalTransform::IDENTITY,
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        let a_main = MainEntity::from(a);
+        let b_main = MainEntity::from(b);
+        let c_main = MainEntity::from(c);
+        let material = AssetId::<StandardMaterial>::default().untyped();
+        let binding = MaterialBindingId {
+            group: MaterialBindGroupIndex(4),
+            slot: MaterialBindGroupSlot(5),
+        };
+        let replacement = MaterialBindingId {
+            group: MaterialBindGroupIndex(8),
+            slot: MaterialBindGroupSlot(9),
+        };
+        let mut materials = RenderMaterialInstances::default();
+        for entity in [a_main, b_main] {
+            materials.instances.insert(
+                entity,
+                RenderMaterialInstance {
+                    asset_id: material,
+                    last_change_tick: bevy_ecs::change_detection::Tick::new(0),
+                },
+            );
+        }
+        let mut bindings = RenderMaterialBindings::default();
+        bindings.insert(material, binding);
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.insert_resource(materials);
+        world.insert_resource(bindings);
+        world.insert_resource(RenderMeshInstances::new(false));
+        world.init_resource::<RenderVisibilityRanges>();
+        world.init_resource::<MeshesToReextractNextFrame>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                view::extract_visibility_ranges,
+                extract_meshes_for_cpu_building,
+            )
+                .chain(),
+        );
+        fn cpu(world: &World) -> &RenderMeshInstancesCpu {
+            let RenderMeshInstances::CpuBuilding(instances) =
+                world.resource::<RenderMeshInstances>()
+            else {
+                panic!("CPU owner")
+            };
+            instances
+        }
+        schedule.run(&mut world);
+        let row = cpu(&world).get(&a_main).unwrap();
+        assert_eq!(row.tag(), 31);
+        assert_eq!(
+            row.transforms.world_from_local,
+            Affine3A::from_translation(Vec3::X).into()
+        );
+        assert_eq!(
+            row.transforms.previous_world_from_local,
+            Affine3A::from_translation(Vec3::Y).into()
+        );
+        assert!(row
+            .flags()
+            .contains(RenderMeshInstanceFlags::HAS_PREVIOUS_TRANSFORM));
+        assert!(!row.flags().contains(RenderMeshInstanceFlags::SHADOW_CASTER));
+        assert!(!row.should_batch());
+        assert_eq!(row.render_layers, Some(RenderLayers::layer(3)));
+        assert_eq!(row.material_bindings_index().slot, binding.slot);
+        let initial_index = cpu(&world).indices[&a_main];
+        let initial_storage = cpu(&world).instances.as_ptr();
+        {
+            let mut owner = world.resource_mut::<RenderMeshInstances>();
+            owner.insert_mesh_instance_flags(a_main, CPU_FRAME_MOTION_FLAGS);
+        }
+        world.resource_mut::<MainWorld>().clear_trackers();
+        schedule.run(&mut world);
+        assert_eq!(cpu(&world).indices[&a_main], initial_index);
+        assert_eq!(cpu(&world).instances.as_ptr(), initial_storage);
+        assert!(!cpu(&world)
+            .get(&a_main)
+            .unwrap()
+            .flags()
+            .intersects(CPU_FRAME_MOTION_FLAGS));
+
+        // An unchanged source can receive a new binding, including a material
+        // removed without changing its mesh component.
+        world
+            .resource_mut::<RenderMaterialBindings>()
+            .insert(material, replacement);
+        world.resource_mut::<MainWorld>().clear_trackers();
+        schedule.run(&mut world);
+        assert_eq!(
+            cpu(&world)
+                .get(&a_main)
+                .unwrap()
+                .material_bindings_index()
+                .slot,
+            replacement.slot
+        );
+        {
+            let mut materials = world.resource_mut::<RenderMaterialInstances>();
+            materials.instances.remove(&a_main);
+            materials.changed_entities.push(a_main);
+        }
+        world.resource_mut::<MainWorld>().clear_trackers();
+        schedule.run(&mut world);
+        assert_eq!(
+            cpu(&world)
+                .get(&a_main)
+                .unwrap()
+                .material_bindings_index()
+                .slot,
+            MaterialBindingId::default().slot
+        );
+        assert_eq!(
+            cpu(&world)
+                .get(&b_main)
+                .unwrap()
+                .material_bindings_index()
+                .slot,
+            replacement.slot
+        );
+        world
+            .resource_mut::<RenderMaterialInstances>()
+            .changed_entities
+            .clear();
+
+        // Optional removals, hidden rows, required removals and same-frame
+        // remove/re-add must reconcile the final source state and dense index.
+        {
+            let mut main = world.resource_mut::<MainWorld>();
+            main.clear_trackers();
+            main.entity_mut(a).remove::<(
+                MeshTag,
+                PreviousGlobalTransform,
+                NoFrustumCulling,
+                NotShadowReceiver,
+                TransmittedShadowReceiver,
+                NotShadowCaster,
+                NoAutomaticBatching,
+                RenderLayers,
+                VisibilityRange,
+            )>();
+            *main.get_mut::<GlobalTransform>(a).unwrap() =
+                GlobalTransform::from_translation(Vec3::Z);
+            *main.get_mut::<ViewVisibility>(b).unwrap() = ViewVisibility::HIDDEN;
+            main.entity_mut(c).remove::<GlobalTransform>();
+        }
+        schedule.run(&mut world);
+        let row = cpu(&world).get(&a_main).unwrap();
+        assert_eq!(row.tag(), 0);
+        assert_eq!(
+            row.transforms.world_from_local,
+            row.transforms.previous_world_from_local
+        );
+        assert!(!row
+            .flags()
+            .contains(RenderMeshInstanceFlags::HAS_PREVIOUS_TRANSFORM));
+        assert!(row.flags().contains(RenderMeshInstanceFlags::SHADOW_CASTER));
+        assert!(row.should_batch());
+        assert!(row.render_layers.is_none());
+        assert!(row.transforms.flags & MeshFlags::SHADOW_RECEIVER.bits() != 0);
+        assert_eq!(
+            row.transforms.flags & MeshFlags::LOD_INDEX_MASK.bits(),
+            u16::MAX as u32
+        );
+        assert!(cpu(&world).get(&b_main).is_none());
+        assert!(cpu(&world).get(&c_main).is_none());
+        assert_eq!(cpu(&world).instances.len(), 1);
+        {
+            let mut main = world.resource_mut::<MainWorld>();
+            main.clear_trackers();
+            *main.get_mut::<ViewVisibility>(b).unwrap() = ViewVisibility::VISIBLE;
+            main.entity_mut(b).remove::<Mesh3d>().insert(mesh.clone());
+        }
+        schedule.run(&mut world);
+        assert!(cpu(&world).get(&b_main).is_some());
+        assert!(cpu(&world).get(&a_main).is_some());
+        // Reinstallation must admit unchanged sources without relying on
+        // component change ticks from before a render-device recovery.
+        world.resource_mut::<MainWorld>().clear_trackers();
+        world.insert_resource(RenderMeshInstances::new(false));
+        schedule.run(&mut world);
+        assert!(cpu(&world).get(&a_main).is_some());
+        assert!(cpu(&world).get(&b_main).is_some());
+        assert!(cpu(&world).get(&c_main).is_none());
+        // Despawn and generation reuse cannot alias a retained dense row.
+        let new = {
+            let mut main = world.resource_mut::<MainWorld>();
+            main.clear_trackers();
+            main.despawn(b);
+            main.spawn((mesh, GlobalTransform::IDENTITY, ViewVisibility::VISIBLE))
+                .id()
+        };
+        schedule.run(&mut world);
+        assert!(cpu(&world).get(&b_main).is_none());
+        assert!(cpu(&world).get(&MainEntity::from(new)).is_some());
+        assert!(cpu(&world).get(&a_main).is_some());
+    }
 
     #[test]
     fn cpu_mesh_uniforms_dense_borrow_and_refresh() {

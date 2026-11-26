@@ -380,6 +380,9 @@ impl Plugin for PbrPlugin {
                     extract_ambient_light,
                     extract_shadow_filtering_method,
                     extract_shadow_lod_origin,
+                    begin_material_extraction
+                        .before(MaterialExtractionSystems)
+                        .before(late_sweep_material_instances),
                     late_sweep_material_instances,
                 ),
             )
