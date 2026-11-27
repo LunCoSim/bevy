@@ -407,6 +407,15 @@ pub fn check_dir_light_mesh_visibility(
             )>,
         ),
     >,
+    disabled: Query<
+        Entity,
+        (
+            With<Mesh3d>,
+            With<InheritedVisibility>,
+            Added<bevy_ecs::entity_disabling::Disabled>,
+            Allow<bevy_ecs::entity_disabling::Disabled>,
+        ),
+    >,
     (
         mut removed_mesh,
         mut removed_inherited,
@@ -418,6 +427,7 @@ pub fn check_dir_light_mesh_visibility(
         mut removed_no_cpu,
         mut removed_no_frustum,
         mut removed_range,
+        mut removed_disabled,
     ): (
         RemovedComponents<Mesh3d>,
         RemovedComponents<InheritedVisibility>,
@@ -429,6 +439,7 @@ pub fn check_dir_light_mesh_visibility(
         RemovedComponents<NoCpuCulling>,
         RemovedComponents<NoFrustumCulling>,
         RemovedComponents<VisibilityRange>,
+        RemovedComponents<bevy_ecs::entity_disabling::Disabled>,
     ),
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
     mut defer_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
@@ -451,7 +462,9 @@ pub fn check_dir_light_mesh_visibility(
             .chain(removed_light.read())
             .chain(removed_no_cpu.read())
             .chain(removed_no_frustum.read())
-            .chain(removed_range.read()),
+            .chain(removed_range.read())
+            .chain(removed_disabled.read())
+            .chain(disabled.iter()),
     );
     let mut collected = false;
     let mut publication = Vec::new();
@@ -1434,6 +1447,29 @@ mod directional_shadow_receiver_tests {
             .all(|&entity| world.get::<ViewVisibility>(entity).unwrap().get()));
 
         let first = entities[0];
+        *world
+            .get_mut::<ViewVisibility>(first)
+            .unwrap()
+            .bypass_change_detection() = ViewVisibility::HIDDEN;
+        world
+            .entity_mut(first)
+            .insert(bevy_ecs::entity_disabling::Disabled);
+        schedule.run(world);
+        assert!(!world
+            .get::<VisibleEntities>(view)
+            .unwrap()
+            .get(class)
+            .contains(&first));
+        assert!(!world.get::<ViewVisibility>(first).unwrap().get());
+        world
+            .entity_mut(first)
+            .remove::<bevy_ecs::entity_disabling::Disabled>();
+        schedule.run(world);
+        assert_eq!(
+            world.get::<VisibleEntities>(view).unwrap().get(class),
+            initial
+        );
+        assert!(world.get::<ViewVisibility>(first).unwrap().get());
         world.entity_mut(first).insert(RenderLayers::layer(1));
         *world
             .get_mut::<ViewVisibility>(first)
@@ -1571,6 +1607,32 @@ mod directional_shadow_receiver_tests {
             .iter()
             .all(|&entity| world.get::<ViewVisibility>(entity).unwrap().get()));
         let first = entities[0];
+        *world
+            .get_mut::<ViewVisibility>(first)
+            .unwrap()
+            .bypass_change_detection() = ViewVisibility::HIDDEN;
+        world
+            .entity_mut(first)
+            .insert(bevy_ecs::entity_disabling::Disabled);
+        schedule.run(world);
+        assert!(world
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities[&view]
+            .iter()
+            .all(|cascade| !cascade.entities.contains(&first)));
+        assert!(!world.get::<ViewVisibility>(first).unwrap().get());
+        world
+            .entity_mut(first)
+            .remove::<bevy_ecs::entity_disabling::Disabled>();
+        schedule.run(world);
+        assert!(world
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities[&view]
+            .iter()
+            .all(|cascade| cascade.entities == initial));
+        assert!(world.get::<ViewVisibility>(first).unwrap().get());
         world.entity_mut(first).insert(NotShadowCaster);
         *world
             .get_mut::<ViewVisibility>(first)

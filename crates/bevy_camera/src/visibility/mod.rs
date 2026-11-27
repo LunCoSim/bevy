@@ -796,6 +796,16 @@ pub fn check_visibility_cpu_culling(
             Without<NoCpuCulling>,
         >,
     )>,
+    disabled: Query<
+        Entity,
+        (
+            With<InheritedVisibility>,
+            With<ViewVisibility>,
+            With<GlobalTransform>,
+            Added<bevy_ecs::entity_disabling::Disabled>,
+            Allow<bevy_ecs::entity_disabling::Disabled>,
+        ),
+    >,
     (
         mut removed_inherited,
         mut removed_view_visibility,
@@ -807,6 +817,7 @@ pub fn check_visibility_cpu_culling(
         mut removed_no_frustum,
         mut removed_no_cpu,
         mut removed_range,
+        mut removed_disabled,
     ): (
         RemovedComponents<InheritedVisibility>,
         RemovedComponents<ViewVisibility>,
@@ -818,11 +829,13 @@ pub fn check_visibility_cpu_culling(
         RemovedComponents<NoFrustumCulling>,
         RemovedComponents<NoCpuCulling>,
         RemovedComponents<VisibilityRange>,
+        RemovedComponents<bevy_ecs::entity_disabling::Disabled>,
     ),
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
-    // An optional-component removal can change eligibility without a Changed tick.
+    // Optional-component removals and disabling transitions can change eligibility
+    // without a Changed tick on the culling inputs.
     dirty.clear();
     dirty.extend(
         removed_inherited
@@ -835,7 +848,9 @@ pub fn check_visibility_cpu_culling(
             .chain(removed_transform.read())
             .chain(removed_no_frustum.read())
             .chain(removed_no_cpu.read())
-            .chain(removed_range.read()),
+            .chain(removed_range.read())
+            .chain(removed_disabled.read())
+            .chain(disabled.iter()),
     );
     let mut collected = false;
     cache.retain(|view, _| view_query.get(*view).is_ok());
